@@ -4,7 +4,10 @@ import time
 import torch
 import torch.nn as nn
 import os
+
+from torch import optim
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 LR = 1e-4
 BATCH_SIZE = 128
@@ -13,6 +16,7 @@ EPOCHS = 32
 GOL_DELTA = 1
 RUN_NAME = time.strftime("%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(GOL_DELTA)
 SNAPSHOTS_DIR = '../out/training/snapshots/{}'.format(RUN_NAME)
+TENSORBOARD_LOGS_DIR = '../out/training/logs'
 
 
 def step(state: np.array):
@@ -62,6 +66,23 @@ def create_training_sample(shape=(25, 25), warmup_steps=5, delta=1):
             }
 
 
+class ResBlock(nn.Module):
+    def __init__(self, features):
+        super().__init__()
+
+        self.main = nn.Sequential(
+            nn.BatchNorm2d(features),
+            nn.ReLU(True),
+            nn.Conv2d(features, features, 3, padding=0, bias=False),
+            nn.BatchNorm2d(features),
+            nn.ReLU(True),
+            nn.Conv2d(features, features, 3, padding=0,  bias=False)
+        )
+
+    def forward(self, x):
+        return self.main(x) + x[:, :, 2:-2, 2:-2]
+
+
 class GoLDataset(Dataset):
     def __init__(self, shape=(25, 25), warmup_steps=5, delta=1, size=1024, outline_size=0):
         self.shape = shape
@@ -97,13 +118,7 @@ class GoLDataset(Dataset):
             axis=2
         )
 
-        target_dead = (1 - start).astype(np.float)
-        target_alive = start.astype(np.float)
-        sample_target = np.stack([
-            target_dead,
-            target_alive],
-            axis=2
-        )
+        sample_target = start
 
         # outlining
         if self.outline_size > 0:
@@ -117,23 +132,26 @@ class GoLDataset(Dataset):
                            offset_y:(offset_y + self.shape[0] + 2 * self.outline_size),
                            offset_x:(offset_x + self.shape[1] + 2 * self.outline_size)
                            ]
-            print(sample_input.shape)
 
         return {
-            "input": sample_input,
-            "mask": predicted_mask.astype(float),
+            "input": sample_input.transpose((2, 0, 1)),
+            "mask": np.expand_dims(predicted_mask.astype(np.float), 3).transpose((2, 0, 1)),
             "target": sample_target
         }
 
 
 class GoLModule(nn.Module):
-    def __init__(self):
+    def __init__(self, channels=64):
         super().__init__()
 
         self.main = nn.Sequential(
-            nn.Conv2d(5, 32, 1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True)
+            nn.Conv2d(5, channels, 1, bias=False),
+            ResBlock(channels),
+            ResBlock(channels),
+            ResBlock(channels),
+            ResBlock(channels),
+            nn.BatchNorm2d(channels),
+            nn.Conv2d(channels, 2, 1)
         )
 
     def forward(self, x):
@@ -141,21 +159,37 @@ class GoLModule(nn.Module):
 
 
 if __name__ == "__main__":
+    device = torch.device('cuda')
 
-    dataset = GoLDataset(delta=GOL_DELTA, size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=2)
-
-    s = dataset[0]
-    plot(s['input'][:, :, 1].astype(np.int))
-    exit()
+    dataset = GoLDataset(delta=GOL_DELTA, size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=4*2)
     loader = DataLoader(dataset,
                         batch_size=BATCH_SIZE,
                         num_workers=1,
                         pin_memory=True)
 
+    net = GoLModule()
+    net.to(device)
+    optimizer = optim.Adam(net.parameters(), lr=LR)
+    cel = nn.CrossEntropyLoss()
+
     if not os.path.isdir(SNAPSHOTS_DIR):
         os.makedirs(SNAPSHOTS_DIR)
+    # train_writer = SummaryWriter(log_dir=TENSORBOARD_LOGS_DIR + '/' + RUN_NAME, comment=RUN_NAME)
 
     for epoch in range(EPOCHS):
         batch_iter = iter(loader)
         for step in range(STEPS_PER_EPOCH):
-            pass
+            batch = next(batch_iter)
+
+            net.zero_grad()
+            torch_input = batch['input'].float().to(device)
+            torch_target = batch['target'].long().to(device)
+            prediction = net(torch_input)
+            loss = cel(prediction, torch_target)
+
+            loss.backward()
+            optimizer.step()
+
+            print('Epoch {} - Step {} - loss {:.5f}'.format(epoch + 1, step + 1, loss.item()))
+
+    print("Done!")
