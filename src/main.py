@@ -1,7 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import time
-import random
 import torch
 import torch.nn as nn
 import os
@@ -64,11 +63,12 @@ def create_training_sample(shape=(25, 25), warmup_steps=5, delta=1):
 
 
 class GoLDataset(Dataset):
-    def __init__(self, shape=(25, 25), warmup_steps=5, delta=1, size=1024):
+    def __init__(self, shape=(25, 25), warmup_steps=5, delta=1, size=1024, outline_size=0):
         self.shape = shape
         self.warmup_steps = warmup_steps
         self.delta = delta
         self.size = size
+        self.outline_size = outline_size
 
     def __len__(self):
         return self.size
@@ -105,6 +105,20 @@ class GoLDataset(Dataset):
             axis=2
         )
 
+        # outlining
+        if self.outline_size > 0:
+            tiles_y = ((self.outline_size - 1) // self.shape[0]) * 2 + 2 + 1
+            tiles_x = ((self.outline_size - 1) // self.shape[1]) * 2 + 2 + 1
+            offset_y = self.shape[0] - ((self.outline_size - 1) % self.shape[0]) - 1
+            offset_x = self.shape[1] - ((self.outline_size - 1) % self.shape[1]) - 1
+
+            sample_input = np.tile(sample_input, (tiles_y, tiles_x, 1))
+            sample_input = sample_input[
+                           offset_y:(offset_y + self.shape[0] + 2 * self.outline_size),
+                           offset_x:(offset_x + self.shape[1] + 2 * self.outline_size)
+                           ]
+            print(sample_input.shape)
+
         return {
             "input": sample_input,
             "mask": predicted_mask.astype(float),
@@ -128,8 +142,10 @@ class GoLModule(nn.Module):
 
 if __name__ == "__main__":
 
-    dataset = GoLDataset(delta=GOL_DELTA, size=STEPS_PER_EPOCH * BATCH_SIZE)
-    print(dataset[0])
+    dataset = GoLDataset(delta=GOL_DELTA, size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=2)
+
+    s = dataset[0]
+    plot(s['input'][:, :, 1].astype(np.int))
     exit()
     loader = DataLoader(dataset,
                         batch_size=BATCH_SIZE,
