@@ -1,4 +1,7 @@
+import cv2
 import numpy as np
+import matplotlib
+matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import time
 import torch
@@ -10,16 +13,18 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 LR = 1e-4
-BATCH_SIZE = 128
-STEPS_PER_EPOCH = 128
-EPOCHS = 32
+BATCH_SIZE = 256
+STEPS_PER_EPOCH = 256
+EPOCHS = 128
 GOL_DELTA = 1
+TEST_SAMPLES = 10
 RUN_NAME = time.strftime("%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(GOL_DELTA)
 SNAPSHOTS_DIR = '../out/training/snapshots/{}'.format(RUN_NAME)
 TENSORBOARD_LOGS_DIR = '../out/training/logs'
+VIDEO_DIR = '../out/training/videos/{}'.format(RUN_NAME)
 
 
-def step(state: np.array):
+def state_step(state: np.array):
     neighbour_sum = \
         np.roll(state, -1, axis=0) + \
         np.roll(state, 1, axis=0) + \
@@ -45,7 +50,7 @@ def create_random_board(shape=(25, 25), warmup_steps=5):
     state = (np.random.uniform(0.0, 1.0, shape) > factor).astype(np.int)
 
     for i in range(warmup_steps):
-        state = step(state)
+        state = state_step(state)
 
     return state
 
@@ -56,7 +61,7 @@ def create_training_sample(shape=(25, 25), warmup_steps=5, delta=1):
         start = create_random_board(shape, warmup_steps)
         end = start
         for i in range(delta):
-            end = step(end)
+            end = state_step(end)
 
         if np.any(end):
             return {
@@ -83,6 +88,37 @@ class ResBlock(nn.Module):
         return self.main(x) + x[:, :, 2:-2, 2:-2]
 
 
+def create_net_input_array(state: np.array, predicted_mask: np.array, predictions: np.array, outline_size=0):
+    input_dead = (1 - state).astype(np.float)
+    input_alive = state.astype(np.float)
+    input_unpredicted = (1 - predicted_mask).astype(np.float)
+    input_predicted_dead = ((1 - predictions) * predicted_mask).astype(np.float)
+    input_predicted_alive = (predictions * predicted_mask).astype(np.float)
+    sample_input = np.stack([
+        input_dead,
+        input_alive,
+        input_unpredicted,
+        input_predicted_dead,
+        input_predicted_alive],
+        axis=2
+    )
+
+    # outlining
+    if outline_size > 0:
+        tiles_y = ((outline_size - 1) // state.shape[0]) * 2 + 2 + 1
+        tiles_x = ((outline_size - 1) // state.shape[1]) * 2 + 2 + 1
+        offset_y = state.shape[0] - ((outline_size - 1) % state.shape[0]) - 1
+        offset_x = state.shape[1] - ((outline_size - 1) % state.shape[1]) - 1
+
+        sample_input = np.tile(sample_input, (tiles_y, tiles_x, 1))
+        sample_input = sample_input[
+                       offset_y:(offset_y + state.shape[0] + 2 * outline_size),
+                       offset_x:(offset_x + state.shape[1] + 2 * outline_size)
+                       ]
+
+    return sample_input.transpose((2, 0, 1)).astype(np.float)
+
+
 class GoLDataset(Dataset):
     def __init__(self, shape=(25, 25), warmup_steps=5, delta=1, size=1024, outline_size=0):
         self.shape = shape
@@ -104,37 +140,14 @@ class GoLDataset(Dataset):
         if np.sum(predicted_mask) == self.shape[0] * self.shape[1]:
             predicted_mask[np.random.randint(0, self.shape[0], (1, )), np.random.randint(0, self.shape[1], (1, ))] = 0
 
-        input_dead = (1 - end).astype(np.float)
-        input_alive = end.astype(np.float)
-        input_unpredicted = (1 - predicted_mask).astype(np.float)
-        input_predicted_dead = ((1 - start) * predicted_mask).astype(np.float)
-        input_predicted_alive = (start * predicted_mask).astype(np.float)
-        sample_input = np.stack([
-            input_dead,
-            input_alive,
-            input_unpredicted,
-            input_predicted_dead,
-            input_predicted_alive],
-            axis=2
-        )
+        sample_input = create_net_input_array(end, predicted_mask, start, outline_size=self.outline_size)
 
         sample_target = start
 
-        # outlining
-        if self.outline_size > 0:
-            tiles_y = ((self.outline_size - 1) // self.shape[0]) * 2 + 2 + 1
-            tiles_x = ((self.outline_size - 1) // self.shape[1]) * 2 + 2 + 1
-            offset_y = self.shape[0] - ((self.outline_size - 1) % self.shape[0]) - 1
-            offset_x = self.shape[1] - ((self.outline_size - 1) % self.shape[1]) - 1
 
-            sample_input = np.tile(sample_input, (tiles_y, tiles_x, 1))
-            sample_input = sample_input[
-                           offset_y:(offset_y + self.shape[0] + 2 * self.outline_size),
-                           offset_x:(offset_x + self.shape[1] + 2 * self.outline_size)
-                           ]
 
         return {
-            "input": sample_input.transpose((2, 0, 1)),
+            "input": sample_input,
             "mask": np.expand_dims(predicted_mask.astype(np.float), 3).transpose((2, 0, 1)),
             "target": sample_target
         }
@@ -154,14 +167,132 @@ class GoLModule(nn.Module):
             nn.Conv2d(channels, 2, 1)
         )
 
+        self.softmax = nn.Softmax(2)
+
+    def get_num_trainable_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def get_l1_loss_of_parameters(self):
+        loss = None
+        for param in self.parameters():
+            if loss is None:
+                loss = torch.abs(param)
+            else:
+                loss += torch.abs(param)
+
+        return loss * (1. / self.get_num_trainable_parameters())
+
+    def get_l2_loss_of_parameters(self):
+        loss = None
+        for param in self.parameters():
+            if loss is None:
+                loss = torch.sum(torch.mul(param, param))
+            else:
+                loss += torch.sum(torch.mul(param, param))
+
+        return loss * (1. / self.get_num_trainable_parameters())
+
     def forward(self, x):
         return self.main(x)
 
+    def get_probabilities(self, x):
+        return self.softmax(self.main(x))
 
-if __name__ == "__main__":
+    def get_best_guess(self, x: torch.tensor, mask: np.array):
+        probabilities = self.get_probabilities(x)
+        masked_probabilities = np.array(probabilities.tolist()) * (1 - mask)
+        guess = np.unravel_index(masked_probabilities.argmax(), masked_probabilities.shape)
+        return {
+            "coord_yx": np.array([guess[2], guess[3]]),
+            "alive": guess[1]
+        }
+
+    def get_probabilities_img(self, x):
+        return np.array(self.get_probabilities(x).tolist()).transpose((0, 2, 3, 1))[0, :, :, 0]
+
+    def solve(self,
+              state: np.array,
+              device: torch.device,
+              ground_truth=None,
+              plot_each_step=False,
+              plot_result=False,
+              video_fname=None):
+
+        predicted_mask = np.zeros(state.shape)
+        predictions = np.zeros(state.shape)
+
+        total_runs = state.shape[0] * state.shape[1]
+
+        video_out = None
+        for i in range(total_runs):
+            sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=4*2)
+            batch_input = torch.from_numpy(np.expand_dims(sample_input, 0)).float().to(device)
+            guess = self.get_best_guess(batch_input, predicted_mask)
+            prev_predicted_mask = predicted_mask.copy()
+            predicted_mask[guess['coord_yx'][0], guess['coord_yx'][1]] = 1
+            predictions[guess['coord_yx'][0], guess['coord_yx'][1]] = guess['alive']
+
+            if plot_each_step or (i == total_runs - 1 and plot_result) or video_fname is not None:
+
+                # data
+                fig = plt.figure()
+                sub = fig.add_subplot(2, 3, 1)
+                sub.set_title("start (ground truth)")
+                if ground_truth is not None:
+                    sub.imshow(ground_truth.astype(np.float))
+                sub = fig.add_subplot(2, 3, 4)
+                sub.set_title("end (input)")
+                sub.imshow(state.astype(np.float))
+
+                # net
+                sub = fig.add_subplot(2, 3, 6)
+                sub.set_title("Certainty heatmap {} {}".format(guess['coord_yx'], guess["alive"]))
+                prob = self.get_probabilities_img(batch_input)
+                prob[prob < 0.5] *= -1
+                prob[prob < 0.5] += 1.0
+                prob *= (1 - prev_predicted_mask)
+                sub.imshow(prob, vmin=0.0, vmax=1.0)
+                sub = fig.add_subplot(2, 3, 3)
+                sub.set_title("already predicted mask")
+                sub.imshow(predicted_mask.astype(np.float))
+
+                # outcome
+                sub = fig.add_subplot(2, 3, 2)
+                sub.set_title("net prediction")
+                sub.imshow(predictions.astype(np.float))
+                sub = fig.add_subplot(2, 3, 5)
+                outc = predictions
+                for d in range(GOL_DELTA):
+                    outc = state_step(outc)
+                sub.imshow(outc.astype(np.float))
+
+                fig.canvas.draw()
+
+                data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+                img = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+
+                if video_fname is not None:
+                    if video_out is None:
+
+                        if not os.path.exists(os.path.dirname(video_fname)):
+                            os.makedirs(os.path.dirname(video_fname))
+
+                        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                        video_out = cv2.VideoWriter(video_fname, fourcc, 60.0,
+                                                         (img.shape[1], img.shape[0]))
+                    video_out.write(img[:, :, ::-1])
+                plt.close(fig)
+
+        if video_out is not None:
+            video_out.release()
+
+        return predictions
+
+
+def main():
     device = torch.device('cuda')
 
-    dataset = GoLDataset(delta=GOL_DELTA, size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=4*2)
+    dataset = GoLDataset(delta=GOL_DELTA, size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=4 * 2)
     loader = DataLoader(dataset,
                         batch_size=BATCH_SIZE,
                         num_workers=1,
@@ -169,13 +300,14 @@ if __name__ == "__main__":
 
     net = GoLModule()
     net.to(device)
+    display_sample = create_training_sample()
+    test_samples = [create_training_sample() for i in range(TEST_SAMPLES)]
     optimizer = optim.Adam(net.parameters(), lr=LR)
     cel = nn.CrossEntropyLoss()
 
-    if not os.path.isdir(SNAPSHOTS_DIR):
-        os.makedirs(SNAPSHOTS_DIR)
-    # train_writer = SummaryWriter(log_dir=TENSORBOARD_LOGS_DIR + '/' + RUN_NAME, comment=RUN_NAME)
+    train_writer = SummaryWriter(log_dir=TENSORBOARD_LOGS_DIR + '/' + RUN_NAME, comment=RUN_NAME)
 
+    total_steps = 0
     for epoch in range(EPOCHS):
         batch_iter = iter(loader)
         for step in range(STEPS_PER_EPOCH):
@@ -185,11 +317,51 @@ if __name__ == "__main__":
             torch_input = batch['input'].float().to(device)
             torch_target = batch['target'].long().to(device)
             prediction = net(torch_input)
-            loss = cel(prediction, torch_target)
+            weight_loss = net.get_l2_loss_of_parameters()
+            classification_loss = cel(prediction, torch_target)
+            loss = weight_loss + classification_loss
 
             loss.backward()
             optimizer.step()
 
-            print('Epoch {} - Step {} - loss {:.5f}'.format(epoch + 1, step + 1, loss.item()))
+            if (step) % 16 == 0:
+                loss_item = loss.item()
+                print('Epoch {} - Step {} - loss {:.5f}'.format(epoch + 1, step + 1, loss_item))
+                train_writer.add_scalar('loss/weights-l2', weight_loss.item(), total_steps)
+                train_writer.add_scalar('loss/class-ce', classification_loss.item(), total_steps)
+                train_writer.add_scalar('loss/train', loss_item, total_steps)
+
+            total_steps += 1
+
+        net.eval()
+
+        print("Create test video")
+        net.solve(display_sample['end'],
+                  device,
+                  display_sample['start'],
+                  video_fname='{}/epoch_{:03}.avi'.format(VIDEO_DIR, epoch + 1)
+                  )
+
+        print("Calculate epoch loss")
+        epoch_loss = 0
+        for test_sample in test_samples:
+            res = net.solve(test_sample['end'], device, test_sample['start'])
+            outc = res
+            for d in range(GOL_DELTA):
+                outc = state_step(outc)
+
+            epoch_loss += np.mean(np.abs((outc - test_sample['end'])))
+        epoch_loss /= len(test_samples)
+        print("Epoch loss {}".format(epoch_loss))
+        train_writer.add_scalar('loss/test', epoch_loss)
+        net.train()
+
+        if not os.path.isdir(SNAPSHOTS_DIR):
+            os.makedirs(SNAPSHOTS_DIR)
+        torch.save(net.state_dict(), '{}/epoch_{:03}.pt'.format(SNAPSHOTS_DIR, epoch + 1))
 
     print("Done!")
+
+
+if __name__ == "__main__":
+    main()
