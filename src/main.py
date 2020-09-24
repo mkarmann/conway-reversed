@@ -13,11 +13,11 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 LR = 1e-4
-BATCH_SIZE = 64
-STEPS_PER_EPOCH = 128
+BATCH_SIZE = 128
+STEPS_PER_EPOCH = 1024
 EPOCHS = 64
 GOL_DELTA = 1
-TEST_SAMPLES = 1
+TEST_SAMPLES = 20
 RUN_NAME = time.strftime("%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(GOL_DELTA)
 SNAPSHOTS_DIR = '../out/training/snapshots/{}'.format(RUN_NAME)
 TENSORBOARD_LOGS_DIR = '../out/training/logs'
@@ -213,8 +213,8 @@ class GoLModule(nn.Module):
             "alive": guess[1]
         }
 
-    def get_probabilities_img(self, x):
-        return np.array(self.get_probabilities(x).tolist()).transpose((0, 2, 3, 1))[0, :, :, 0]
+    def get_tendencies_img(self, x):
+        return np.array(self.get_probabilities(x).tolist()).transpose((0, 2, 3, 1))[0, :, :, 1]
 
     def solve(self,
               state: np.array,
@@ -240,7 +240,7 @@ class GoLModule(nn.Module):
             if plot_each_step or (i == total_runs - 1 and plot_result) or video_fname is not None:
 
                 # data
-                fig = plt.figure()
+                fig = plt.figure(figsize=(16, 9), dpi=100)
                 sub = fig.add_subplot(2, 3, 1)
                 sub.set_title("start (ground truth)")
                 if ground_truth is not None:
@@ -250,16 +250,16 @@ class GoLModule(nn.Module):
                 sub.imshow(state.astype(np.float))
 
                 # net
-                sub = fig.add_subplot(2, 3, 6)
-                sub.set_title("Certainty heatmap {} {}".format(guess['coord_yx'], guess["alive"]))
-                prob = self.get_probabilities_img(batch_input)
+                sub = fig.add_subplot(2, 3, 3)
+                sub.set_title("Certainty heatmap")
+                prob = self.get_tendencies_img(batch_input)
+                overlay = np.ones((state.shape[0], state.shape[1], 4), dtype=np.float)
+                overlay[:, :, 3] = predicted_mask
                 # prob[prob < 0.5] *= -1
                 # prob[prob < 0.5] += 1.0
                 # prob *= (1 - prev_predicted_mask)
                 sub.imshow(prob, vmin=0.0, vmax=1.0)
-                sub = fig.add_subplot(2, 3, 3)
-                sub.set_title("already predicted mask")
-                sub.imshow(predicted_mask.astype(np.float))
+                sub.imshow(overlay, vmin=0.0, vmax=1.0)
 
                 # outcome
                 sub = fig.add_subplot(2, 3, 2)
@@ -286,6 +286,9 @@ class GoLModule(nn.Module):
                         video_out = cv2.VideoWriter(video_fname, fourcc, 60.0,
                                                          (img.shape[1], img.shape[0]))
                     video_out.write(img[:, :, ::-1])
+                    if i == total_runs - 1:
+                        for n in range(59):
+                            video_out.write(img[:, :, ::-1])
                 plt.close(fig)
 
         if video_out is not None:
