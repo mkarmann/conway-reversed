@@ -13,9 +13,9 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 LR = 1e-4
-BATCH_SIZE = 256
-STEPS_PER_EPOCH = 256
-EPOCHS = 128
+BATCH_SIZE = 64
+STEPS_PER_EPOCH = 1024
+EPOCHS = 64
 GOL_DELTA = 1
 TEST_SAMPLES = 10
 RUN_NAME = time.strftime("%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(GOL_DELTA)
@@ -55,11 +55,11 @@ def create_random_board(shape=(25, 25), warmup_steps=5):
     return state
 
 
-def create_training_sample(shape=(25, 25), warmup_steps=5, delta=1):
+def create_training_sample(shape=(25, 25), warmup_steps=5, delta=GOL_DELTA):
 
     while True:
         start = create_random_board(shape, warmup_steps)
-        end = start
+        end = start.copy()
         for i in range(delta):
             end = state_step(end)
 
@@ -103,6 +103,9 @@ def create_net_input_array(state: np.array, predicted_mask: np.array, prediction
         axis=2
     )
 
+    # plt.subplot(2, 1, 1)
+    # plt.imshow(sample_input[:, :, 0])
+
     # outlining
     if outline_size > 0:
         tiles_y = ((outline_size - 1) // state.shape[0]) * 2 + 2 + 1
@@ -116,11 +119,15 @@ def create_net_input_array(state: np.array, predicted_mask: np.array, prediction
                        offset_x:(offset_x + state.shape[1] + 2 * outline_size)
                        ]
 
+    # plt.subplot(2, 1, 2)
+    # plt.imshow(sample_input[:, :, 0])
+    # plt.show()
+
     return sample_input.transpose((2, 0, 1)).astype(np.float)
 
 
 class GoLDataset(Dataset):
-    def __init__(self, shape=(25, 25), warmup_steps=5, delta=1, size=1024, outline_size=0):
+    def __init__(self, shape=(25, 25), warmup_steps=5, delta=GOL_DELTA, size=1024, outline_size=0):
         self.shape = shape
         self.warmup_steps = warmup_steps
         self.delta = delta
@@ -144,8 +151,6 @@ class GoLDataset(Dataset):
 
         sample_target = start
 
-
-
         return {
             "input": sample_input,
             "mask": np.expand_dims(predicted_mask.astype(np.float), 3).transpose((2, 0, 1)),
@@ -154,11 +159,14 @@ class GoLDataset(Dataset):
 
 
 class GoLModule(nn.Module):
-    def __init__(self, channels=64):
+    def __init__(self, channels=128):
         super().__init__()
 
         self.main = nn.Sequential(
             nn.Conv2d(5, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(True),
+            nn.Conv2d(channels, channels, 1, bias=False),
             ResBlock(channels),
             ResBlock(channels),
             ResBlock(channels),
@@ -292,7 +300,7 @@ class GoLModule(nn.Module):
 def main():
     device = torch.device('cuda')
 
-    dataset = GoLDataset(delta=GOL_DELTA, size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=4 * 2)
+    dataset = GoLDataset(size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=4*2)
     loader = DataLoader(dataset,
                         batch_size=BATCH_SIZE,
                         num_workers=1,
@@ -317,9 +325,9 @@ def main():
             torch_input = batch['input'].float().to(device)
             torch_target = batch['target'].long().to(device)
             prediction = net(torch_input)
-            weight_loss = net.get_l2_loss_of_parameters()
+            # weight_loss = net.get_l2_loss_of_parameters()
             classification_loss = cel(prediction, torch_target)
-            loss = weight_loss + classification_loss
+            loss = classification_loss  # weight_loss + classification_loss
 
             loss.backward()
             optimizer.step()
@@ -327,14 +335,13 @@ def main():
             if (step) % 16 == 0:
                 loss_item = loss.item()
                 print('Epoch {} - Step {} - loss {:.5f}'.format(epoch + 1, step + 1, loss_item))
-                train_writer.add_scalar('loss/weights-l2', weight_loss.item(), total_steps)
+                # train_writer.add_scalar('loss/weights-l2', weight_loss.item(), total_steps)
                 train_writer.add_scalar('loss/class-ce', classification_loss.item(), total_steps)
                 train_writer.add_scalar('loss/train', loss_item, total_steps)
 
             total_steps += 1
 
         net.eval()
-
         print("Create test video")
         net.solve(display_sample['end'],
                   device,
@@ -345,7 +352,7 @@ def main():
         print("Calculate epoch loss")
         epoch_loss = 0
         for test_sample in test_samples:
-            res = net.solve(test_sample['end'], device, test_sample['start'])
+            res = net.solve(test_sample['end'], device)
             outc = res
             for d in range(GOL_DELTA):
                 outc = state_step(outc)
