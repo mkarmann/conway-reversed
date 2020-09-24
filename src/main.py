@@ -14,10 +14,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 LR = 1e-4
 BATCH_SIZE = 64
-STEPS_PER_EPOCH = 1024
+STEPS_PER_EPOCH = 128
 EPOCHS = 64
 GOL_DELTA = 1
-TEST_SAMPLES = 10
+TEST_SAMPLES = 1
 RUN_NAME = time.strftime("%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(GOL_DELTA)
 SNAPSHOTS_DIR = '../out/training/snapshots/{}'.format(RUN_NAME)
 TENSORBOARD_LOGS_DIR = '../out/training/logs'
@@ -175,8 +175,6 @@ class GoLModule(nn.Module):
             nn.Conv2d(channels, 2, 1)
         )
 
-        self.softmax = nn.Softmax(2)
-
     def get_num_trainable_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
@@ -204,7 +202,7 @@ class GoLModule(nn.Module):
         return self.main(x)
 
     def get_probabilities(self, x):
-        return self.softmax(self.main(x))
+        return torch.softmax(self.main(x), 1)
 
     def get_best_guess(self, x: torch.tensor, mask: np.array):
         probabilities = self.get_probabilities(x)
@@ -236,7 +234,6 @@ class GoLModule(nn.Module):
             sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=4*2)
             batch_input = torch.from_numpy(np.expand_dims(sample_input, 0)).float().to(device)
             guess = self.get_best_guess(batch_input, predicted_mask)
-            prev_predicted_mask = predicted_mask.copy()
             predicted_mask[guess['coord_yx'][0], guess['coord_yx'][1]] = 1
             predictions[guess['coord_yx'][0], guess['coord_yx'][1]] = guess['alive']
 
@@ -256,9 +253,9 @@ class GoLModule(nn.Module):
                 sub = fig.add_subplot(2, 3, 6)
                 sub.set_title("Certainty heatmap {} {}".format(guess['coord_yx'], guess["alive"]))
                 prob = self.get_probabilities_img(batch_input)
-                prob[prob < 0.5] *= -1
-                prob[prob < 0.5] += 1.0
-                prob *= (1 - prev_predicted_mask)
+                # prob[prob < 0.5] *= -1
+                # prob[prob < 0.5] += 1.0
+                # prob *= (1 - prev_predicted_mask)
                 sub.imshow(prob, vmin=0.0, vmax=1.0)
                 sub = fig.add_subplot(2, 3, 3)
                 sub.set_title("already predicted mask")
