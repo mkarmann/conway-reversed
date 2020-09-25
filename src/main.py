@@ -1,3 +1,5 @@
+import math
+
 import cv2
 import numpy as np
 import matplotlib
@@ -12,12 +14,14 @@ from torch import optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+
 LR = 1e-4
 BATCH_SIZE = 128
 STEPS_PER_EPOCH = 1024
-EPOCHS = 64
+EPOCHS = 128
 GOL_DELTA = 1
-TEST_SAMPLES = 20
+TEST_SAMPLES = 16
+HALF_LR_AFTER_N_EPOCHS = 32
 RUN_NAME = time.strftime("%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(GOL_DELTA)
 SNAPSHOTS_DIR = '../out/training/snapshots/{}'.format(RUN_NAME)
 TENSORBOARD_LOGS_DIR = '../out/training/logs'
@@ -40,6 +44,10 @@ def state_step(state: np.array):
     return out
 
 
+def state_loss(pred: np.array, target: np.array):
+    return np.mean(np.abs(pred - target))
+
+
 def plot(state: np.array):
     plt.imshow(state.astype(np.float))
     plt.show()
@@ -55,10 +63,10 @@ def create_random_board(shape=(25, 25), warmup_steps=5):
     return state
 
 
-def create_training_sample(shape=(25, 25), warmup_steps=5, delta=GOL_DELTA):
+def create_training_sample(shape=(25, 25), warmup_steps=5, delta=GOL_DELTA, random_warmup=False):
 
     while True:
-        start = create_random_board(shape, warmup_steps)
+        start = create_random_board(shape, warmup_steps + np.random.randint(0, 5) if random_warmup else 0)
         end = start.copy()
         for i in range(delta):
             end = state_step(end)
@@ -78,14 +86,14 @@ class ResBlock(nn.Module):
         self.main = nn.Sequential(
             nn.BatchNorm2d(features),
             nn.ReLU(True),
-            nn.Conv2d(features, features, 3, padding=0, bias=False),
-            nn.BatchNorm2d(features),
+            nn.Conv2d(features, features // 4, 3, padding=0, bias=False),
+            nn.BatchNorm2d(features // 4),
             nn.ReLU(True),
-            nn.Conv2d(features, features, 3, padding=0,  bias=False)
+            nn.Conv2d(features // 4, features, 1, padding=0,  bias=False)
         )
 
     def forward(self, x):
-        return self.main(x) + x[:, :, 2:-2, 2:-2]
+        return self.main(x) + x[:, :, 1:-1, 1:-1]
 
 
 def create_net_input_array(state: np.array, predicted_mask: np.array, predictions: np.array, outline_size=0):
@@ -171,6 +179,15 @@ class GoLModule(nn.Module):
             ResBlock(channels),
             ResBlock(channels),
             ResBlock(channels),
+            ResBlock(channels),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(True),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            ResBlock(channels),
+            ResBlock(channels),
+            ResBlock(channels),
+            ResBlock(channels),
+            ResBlock(channels),
             nn.BatchNorm2d(channels),
             nn.Conv2d(channels, 2, 1)
         )
@@ -231,7 +248,7 @@ class GoLModule(nn.Module):
 
         video_out = None
         for i in range(total_runs):
-            sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=4*2)
+            sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=5*2)
             batch_input = torch.from_numpy(np.expand_dims(sample_input, 0)).float().to(device)
             guess = self.get_best_guess(batch_input, predicted_mask)
             predicted_mask[guess['coord_yx'][0], guess['coord_yx'][1]] = 1
@@ -264,8 +281,12 @@ class GoLModule(nn.Module):
                 # outcome
                 sub = fig.add_subplot(2, 3, 2)
                 sub.set_title("net prediction")
+                overlay = np.ones((state.shape[0], state.shape[1], 4), dtype=np.float)
+                overlay[:, :, 3] = (1.0 - predicted_mask) * 0.66
                 sub.imshow(predictions.astype(np.float))
+                sub.imshow(overlay, vmin=0.0, vmax=1.0)
                 sub = fig.add_subplot(2, 3, 5)
+                sub.set_title("prediction after {} steps".format(GOL_DELTA))
                 outc = predictions
                 for d in range(GOL_DELTA):
                     outc = state_step(outc)
@@ -297,19 +318,42 @@ class GoLModule(nn.Module):
         return predictions
 
 
-def main():
+def test():
+    device = torch.device('cuda')
+    net = GoLModule()
+    net.load_state_dict(torch.load('../out/training/snapshots/2020_09_25_00_22_16_GoL_delta_1/epoch_027.pt'))
+    net.eval()
+    net.to(device)
+
+    error_sum = 0
+    for i in range(20):
+        delta = 1
+        sample = create_training_sample(delta=1)
+        gt_states = [sample['start']]
+        for d in range(delta):
+            gt_states.append(state_step(gt_states[-1]))
+
+        current_solve = gt_states[-1]
+        for d in range(delta):
+            current_solve = net.solve(current_solve, device, gt_states[-(d+2)])      # video_fname='out/vid_out_{}.avi'.format(d + 1))
+            c_error = state_loss(current_solve, gt_states[-(d+2)])
+            print('Error: {}'.format(c_error))
+        error_sum += c_error
+    print('\nMean Error: {}'.format(error_sum / 20))
+
+
+def train():
     device = torch.device('cuda')
 
-    dataset = GoLDataset(size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=4*2)
+    dataset = GoLDataset(size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=5*2)
     loader = DataLoader(dataset,
                         batch_size=BATCH_SIZE,
                         num_workers=1,
                         pin_memory=True)
 
     net = GoLModule()
+    print('Num parameters: {}'.format(net.get_num_trainable_parameters()))
     net.to(device)
-    display_sample = create_training_sample()
-    test_samples = [create_training_sample() for i in range(TEST_SAMPLES)]
     optimizer = optim.Adam(net.parameters(), lr=LR)
     cel = nn.CrossEntropyLoss()
 
@@ -341,8 +385,9 @@ def main():
 
             total_steps += 1
 
-        net.eval()
         print("Create test video")
+        net.eval()
+        display_sample = create_training_sample()
         net.solve(display_sample['end'],
                   device,
                   display_sample['start'],
@@ -351,18 +396,25 @@ def main():
 
         print("Calculate epoch loss")
         epoch_loss = 0
-        for test_sample in test_samples:
+        for t in range(TEST_SAMPLES):
+            test_sample = create_training_sample()
             res = net.solve(test_sample['end'], device)
             outc = res
             for d in range(GOL_DELTA):
                 outc = state_step(outc)
-
             epoch_loss += np.mean(np.abs((outc - test_sample['end'])))
-        epoch_loss /= len(test_samples)
+        epoch_loss /= TEST_SAMPLES
         print("Epoch loss {}".format(epoch_loss))
-        train_writer.add_scalar('loss/test', epoch_loss)
+        train_writer.add_scalar('loss/test', epoch_loss, total_steps)
         net.train()
 
+        # adjust lr
+        new_lr = LR * math.pow(0.5, (epoch / HALF_LR_AFTER_N_EPOCHS))
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = new_lr
+        train_writer.add_scalar('lr', new_lr, total_steps)
+
+        print("Save snapshot")
         if not os.path.isdir(SNAPSHOTS_DIR):
             os.makedirs(SNAPSHOTS_DIR)
         torch.save(net.state_dict(), '{}/epoch_{:03}.pt'.format(SNAPSHOTS_DIR, epoch + 1))
@@ -371,4 +423,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    train()
