@@ -1,3 +1,4 @@
+import pandas as pd
 import math
 
 import cv2
@@ -19,13 +20,16 @@ LR = 1e-4
 BATCH_SIZE = 128
 STEPS_PER_EPOCH = 1024
 EPOCHS = 128
-GOL_DELTA = 1
-TEST_SAMPLES = 16
+GOL_DELTA = 2
+TEST_SAMPLES = 64
 HALF_LR_AFTER_N_EPOCHS = 32
 RUN_NAME = time.strftime("%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(GOL_DELTA)
 SNAPSHOTS_DIR = '../out/training/snapshots/{}'.format(RUN_NAME)
 TENSORBOARD_LOGS_DIR = '../out/training/logs'
 VIDEO_DIR = '../out/training/videos/{}'.format(RUN_NAME)
+SUBMISSION_DIR = '../out/submissions'
+SUBMISSION_FILE_FORMAT = SUBMISSION_DIR + '/submission_{}.csv'
+SCORE_FILE_FORMAT = SUBMISSION_DIR + '/score_{}.csv'
 
 
 def state_step(state: np.array):
@@ -66,7 +70,7 @@ def create_random_board(shape=(25, 25), warmup_steps=5):
 def create_training_sample(shape=(25, 25), warmup_steps=5, delta=GOL_DELTA, random_warmup=False):
 
     while True:
-        start = create_random_board(shape, warmup_steps + np.random.randint(0, 5) if random_warmup else 0)
+        start = create_random_board(shape, warmup_steps + (np.random.randint(0, 5) if random_warmup else 0))
         end = start.copy()
         for i in range(delta):
             end = state_step(end)
@@ -146,7 +150,7 @@ class GoLDataset(Dataset):
         return self.size
 
     def __getitem__(self, idx):
-        sample = create_training_sample(self.shape, self.warmup_steps, self.delta)
+        sample = create_training_sample(self.shape, self.warmup_steps, self.delta, random_warmup=True)
         start = sample["start"]
         end = sample["end"]
         predicted_mask = (np.random.uniform(0.0, 1.0, self.shape) > np.random.uniform(0.0, 1.0, (1, ))).astype(np.int)
@@ -230,8 +234,29 @@ class GoLModule(nn.Module):
             "alive": guess[1]
         }
 
+    def get_best_by_threshold(self, x: torch.tensor, mask: np.array, threshold: float):
+        probabilities = self.get_probabilities(x)
+        masked_probabilities = np.array(probabilities.tolist()) * (1 - mask)
+        results = np.where(masked_probabilities >= threshold)
+        return {
+            "coord_yx": np.array([results[2], results[3]]),
+            "alive": results[1]
+        }
+
     def get_tendencies_img(self, x):
         return np.array(self.get_probabilities(x).tolist()).transpose((0, 2, 3, 1))[0, :, :, 1]
+
+    def solve_pure_gpu(self, state: np.array, device: torch.device):
+        predicted_mask = np.zeros(state.shape)
+        predictions = np.zeros(state.shape)
+        sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=5*2)
+        batch_input = torch.from_numpy(np.expand_dims(sample_input, 0)).float().to(device)
+
+        for i in range(state.shape[0] * state.shape[1]):
+            probabilities = torch.softmax(self.main(batch_input), 1)
+            max_val = torch.argmax(probabilities.reshape((-1, 2 * state.shape[0] * state.shape[1])), 1, keepdim=True).reshape((-1, 2, state.shape[0], state.shape[1]))
+
+            # batch_input[:, ]
 
     def solve(self,
               state: np.array,
@@ -239,7 +264,8 @@ class GoLModule(nn.Module):
               ground_truth=None,
               plot_each_step=False,
               plot_result=False,
-              video_fname=None):
+              video_fname=None,
+              quick_fill_threshold=1):
 
         predicted_mask = np.zeros(state.shape)
         predictions = np.zeros(state.shape)
@@ -250,13 +276,21 @@ class GoLModule(nn.Module):
         for i in range(total_runs):
             sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=5*2)
             batch_input = torch.from_numpy(np.expand_dims(sample_input, 0)).float().to(device)
-            guess = self.get_best_guess(batch_input, predicted_mask)
-            predicted_mask[guess['coord_yx'][0], guess['coord_yx'][1]] = 1
-            predictions[guess['coord_yx'][0], guess['coord_yx'][1]] = guess['alive']
+            if quick_fill_threshold < 1:
+                thr_guess = self.get_best_by_threshold(batch_input, predicted_mask, threshold=quick_fill_threshold)
+                if len(thr_guess['alive']) > 0:
+                    predicted_mask[thr_guess['coord_yx'][0], thr_guess['coord_yx'][1]] = 1
+                    predictions[thr_guess['coord_yx'][0], thr_guess['coord_yx'][1]] = thr_guess['alive']
+                else:
+                    quick_fill_threshold = 1
+            else:
+                guess = self.get_best_guess(batch_input, predicted_mask)
+                predicted_mask[guess['coord_yx'][0], guess['coord_yx'][1]] = 1
+                predictions[guess['coord_yx'][0], guess['coord_yx'][1]] = guess['alive']
 
             if plot_each_step or (i == total_runs - 1 and plot_result) or video_fname is not None:
 
-                # data
+                # input
                 fig = plt.figure(figsize=(16, 9), dpi=100)
                 sub = fig.add_subplot(2, 3, 1)
                 sub.set_title("start (ground truth)")
@@ -321,25 +355,125 @@ class GoLModule(nn.Module):
 def test():
     device = torch.device('cuda')
     net = GoLModule()
-    net.load_state_dict(torch.load('../out/training/snapshots/2020_09_25_00_22_16_GoL_delta_1/epoch_027.pt'))
+    net.load_state_dict(torch.load('../out/training/snapshots/2020_09_25_18_51_41_GoL_delta_1/epoch_103.pt'))
     net.eval()
     net.to(device)
 
+    df_input = pd.read_csv("../input/test.csv")
+    input_values = df_input.values
+
     error_sum = 0
-    for i in range(20):
-        delta = 1
-        sample = create_training_sample(delta=1)
-        gt_states = [sample['start']]
+    for i in range(100):
+        delta = input_values[i][1]
+        end_state = input_values[i][2:].reshape((25, 25))
+        gt_states = [end_state]
         for d in range(delta):
             gt_states.append(state_step(gt_states[-1]))
 
-        current_solve = gt_states[-1]
+        current_solve = end_state
         for d in range(delta):
-            current_solve = net.solve(current_solve, device, gt_states[-(d+2)])      # video_fname='out/vid_out_{}.avi'.format(d + 1))
-            c_error = state_loss(current_solve, gt_states[-(d+2)])
-            print('Error: {}'.format(c_error))
+            prev_solve = current_solve.copy()
+            current_solve = net.solve(current_solve, device)      # video_fname='out/vid_out_{}.avi'.format(d + 1))
+
+        # check error
+        outc = current_solve
+        for d in range(delta):
+            outc = state_step(outc)
+        c_error = state_loss(outc, end_state)
+        print('Error d{}: {}'.format(delta, c_error))
+
         error_sum += c_error
-    print('\nMean Error: {}'.format(error_sum / 20))
+        print("Moving avg: {}\n".format(error_sum / (i + 1)))
+    print('\nMean Error: {}'.format(error_sum / 100))
+
+
+def improve_submission():
+
+    if not os.path.isdir(SUBMISSION_DIR):
+        os.makedirs(SUBMISSION_DIR)
+
+    submission_id = 0
+    while os.path.exists(SUBMISSION_FILE_FORMAT.format(submission_id)):
+        submission_id += 1
+
+    if submission_id == 0:
+        df_submission = pd.read_csv("../input/sample_submission.csv")
+        df_scores = pd.DataFrame(np.ones(len(df_submission), dtype=np.int) * 25 * 25, columns=["num_wrong_cells"])
+    else:
+        df_submission = pd.read_csv(SUBMISSION_FILE_FORMAT.format(submission_id - 1))
+        df_scores = pd.read_csv(SCORE_FILE_FORMAT.format(submission_id - 1))
+
+    input_csv = "../input/test.csv"
+    df_input = pd.read_csv(input_csv)
+    input_values = np.array(df_input.values)
+    scores_values = np.array(df_scores.values)
+    submission_values = np.array(df_submission.values)
+
+    to_check_rows = np.sum(scores_values > 0)
+    print("To check rows: {}".format(to_check_rows))
+
+    # -------------------
+    # init models
+    # -------------------
+
+    device = torch.device('cuda')
+    net = GoLModule()
+    net.load_state_dict(torch.load('../out/training/snapshots/2020_09_25_18_51_41_GoL_delta_1/epoch_103.pt'))
+    net.eval()
+    net.to(device)
+
+    # -------------------
+
+    # loop through examples
+    start_time = time.time()
+    for i in range(len(submission_values)):
+
+        # ignore if errors are already zero
+        old_score = scores_values[i][0]
+        if old_score == 0:
+            continue
+
+        delta = input_values[i][1]
+        stop_state = input_values[i][2:].reshape((25, 25))
+
+        # skipping if wanted
+        if delta > 1:
+            continue
+
+        print("\nRow {} with delta {} has old score: {}".format(i + 1, delta, old_score))
+
+        # -------------------
+        # do the prediction
+        # -------------------
+
+        pred_start_state = net.solve(stop_state, device)
+
+        # -------------------
+
+        pred_end_state = pred_start_state.copy()
+        for d in range(delta):
+            pred_end_state = state_step(pred_end_state)
+
+        new_score = np.sum(np.abs(pred_end_state - stop_state))
+        if new_score < old_score:
+            print("Improved from {} to {}!".format(old_score, new_score))
+            submission_values[i, 1:] = pred_start_state.reshape((-1,))
+            scores_values[i] = new_score
+            print("Mean error is now {}".format(np.mean(scores_values, dtype=np.float) / (25 * 25)))
+
+        print("Estimated time left until finished: {} seconds".format(int((time.time() - start_time) * (len(submission_values) - i - 1) / (i + 1))))
+
+    print("\n------------------------")
+    print("Mean error is now {}".format(np.mean(scores_values) / (25 * 25)))
+    print("Rows left to check: {}".format(np.sum(scores_values > 0)))
+    print("Writing files...")
+
+    df_submission = pd.DataFrame(data=submission_values, columns=list(df_submission.columns.values))
+    df_scores = pd.DataFrame(data=scores_values, columns=list(df_scores.columns.values))
+    df_submission.to_csv(SUBMISSION_FILE_FORMAT.format(submission_id), index=False)
+    df_scores.to_csv(SCORE_FILE_FORMAT.format(submission_id), index=False)
+
+    print("Done!")
 
 
 def train():
@@ -376,7 +510,7 @@ def train():
             loss.backward()
             optimizer.step()
 
-            if (step) % 16 == 0:
+            if step % 16 == 0:
                 loss_item = loss.item()
                 print('Epoch {} - Step {} - loss {:.5f}'.format(epoch + 1, step + 1, loss_item))
                 # train_writer.add_scalar('loss/weights-l2', weight_loss.item(), total_steps)
@@ -397,7 +531,7 @@ def train():
         print("Calculate epoch loss")
         epoch_loss = 0
         for t in range(TEST_SAMPLES):
-            test_sample = create_training_sample()
+            test_sample = create_training_sample(random_warmup=True)
             res = net.solve(test_sample['end'], device)
             outc = res
             for d in range(GOL_DELTA):
@@ -423,4 +557,4 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    improve_submission()
