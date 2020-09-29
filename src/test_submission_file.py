@@ -1,9 +1,11 @@
 import numpy as np
 import pandas as pd
 from main import state_step, state_loss
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
 
-
-SUBMISSION_FILE = "../out/submissions/submission_2.csv"
+SUBMISSION_FILE = "../out/submissions/submission_5.csv"
 
 
 def main():
@@ -18,6 +20,7 @@ def main():
     input_values = df_input.values
     submission_values = df_submission.values
 
+    losses = np.zeros((len(input_values),), dtype=np.float)
     sum = 0
     for i in range(len(input_values)):
         delta = input_values[i][1]
@@ -28,9 +31,21 @@ def main():
         for d in range(delta):
             pred_end_state = state_step(pred_end_state)
 
-        sum += state_loss(pred_end_state, stop_state)
+        loss = state_loss(pred_end_state, stop_state)
+        sum += loss
+        losses[i] = loss
 
     print("mean error: {}".format(sum / len(input_values)))
+
+    kwargs = dict(alpha=0.5, bins=20)
+
+    deltas = input_values[:, 1]
+    colors = ['b', 'g', 'r', 'c', 'm']
+    for i in range(5):
+        plt.hist(losses[deltas == i + 1], **kwargs, color=colors[i], label='delta {}'.format(i + 1))
+    plt.gca().set(title='Distribution of errors per delta', ylabel='Frequency', xlabel='loss')
+    plt.legend()
+    plt.show()
 
 
 if __name__ == "__main__":

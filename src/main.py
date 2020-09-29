@@ -21,8 +21,9 @@ BATCH_SIZE = 128
 STEPS_PER_EPOCH = 1024
 EPOCHS = 128
 GOL_DELTA = 2
-TEST_SAMPLES = 64
+TEST_SAMPLES = 20
 HALF_LR_AFTER_N_EPOCHS = 32
+OUTLINE_SIZE = 5*2
 RUN_NAME = time.strftime("%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(GOL_DELTA)
 SNAPSHOTS_DIR = '../out/training/snapshots/{}'.format(RUN_NAME)
 TENSORBOARD_LOGS_DIR = '../out/training/logs'
@@ -234,6 +235,16 @@ class GoLModule(nn.Module):
             "alive": guess[1]
         }
 
+    def get_best_guesses(self, x: torch.tensor, mask: np.array, num_guesses=2):
+        probabilities = self.get_probabilities(x)
+        masked_probabilities = np.array(probabilities.tolist()) * (1 - mask)
+        guess = np.unravel_index(masked_probabilities.argmax(), masked_probabilities.shape)
+        return {
+            "coord_yx": np.array([guess[2], guess[3]]),
+            "alive": guess[1]
+        }
+
+
     def get_best_by_threshold(self, x: torch.tensor, mask: np.array, threshold: float):
         probabilities = self.get_probabilities(x)
         masked_probabilities = np.array(probabilities.tolist()) * (1 - mask)
@@ -249,7 +260,7 @@ class GoLModule(nn.Module):
     def solve_pure_gpu(self, state: np.array, device: torch.device):
         predicted_mask = np.zeros(state.shape)
         predictions = np.zeros(state.shape)
-        sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=5*2)
+        sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=OUTLINE_SIZE)
         batch_input = torch.from_numpy(np.expand_dims(sample_input, 0)).float().to(device)
 
         for i in range(state.shape[0] * state.shape[1]):
@@ -258,6 +269,51 @@ class GoLModule(nn.Module):
 
             # batch_input[:, ]
 
+    def solve_batch(self, states: np.array, device: torch.device, best_guesses_per_sample=1):
+        predicted_masks = np.zeros(states.shape)
+        predictions = np.zeros(states.shape)
+        batches_indices = np.arange(0, states.shape[0])
+
+        total_runs = states.shape[1] * states.shape[2]
+        sample_inputs = np.zeros((states.shape[0], 5, states.shape[1] + 2 * OUTLINE_SIZE, states.shape[2] + 2 * OUTLINE_SIZE), dtype=np.float)
+
+        for i in range(total_runs):
+            for b in range(states.shape[0]):
+                sample_inputs[b] = create_net_input_array(states[b], predicted_masks[b], predictions[b], outline_size=OUTLINE_SIZE)
+            input_tensor = torch.from_numpy(sample_inputs).float().to(device)
+
+
+            if best_guesses_per_sample == 1 or i > total_runs // 2:
+
+                # only chose the best guess
+                probabilities = self.get_probabilities(input_tensor)
+                masked_probabilities = np.array(probabilities.tolist()) * (1 - predicted_masks.reshape((-1, 1, states.shape[1], states.shape[2])))
+                maxes = np.argmax(masked_probabilities.reshape((-1, 2 * states.shape[1] * states.shape[2])), axis=1)
+                guesses = np.unravel_index(maxes, probabilities.shape)
+                predicted_masks[batches_indices, guesses[2], guesses[3]] = 1
+                predictions[batches_indices, guesses[2], guesses[3]] = guesses[1]
+
+            else:
+
+                num_best_guesses = min(best_guesses_per_sample, total_runs - i)
+
+                # select between multiple best guesses
+                probabilities = self.get_probabilities(input_tensor)
+                masked_probabilities = np.array(probabilities.tolist()) * (
+                            1 - predicted_masks.reshape((-1, 1, states.shape[1], states.shape[2])))
+                maxes_all = np.zeros((states.shape[0], num_best_guesses), dtype=np.int)
+                mkp = masked_probabilities.reshape((-1, 2 * states.shape[1] * states.shape[2]))
+                for g in range(num_best_guesses):
+                    maxes = np.argmax(mkp, axis=1)
+                    maxes_all[:, g] = maxes
+                    mkp[batches_indices, maxes] = 0
+
+                maxes = maxes_all[:, np.random.randint(0, num_best_guesses, states.shape[0])]
+                guesses = np.unravel_index(maxes, probabilities.shape)
+                predicted_masks[batches_indices, guesses[2], guesses[3]] = 1
+                predictions[batches_indices, guesses[2], guesses[3]] = guesses[1]
+        return predictions
+
     def solve(self,
               state: np.array,
               device: torch.device,
@@ -265,7 +321,7 @@ class GoLModule(nn.Module):
               plot_each_step=False,
               plot_result=False,
               video_fname=None,
-              quick_fill_threshold=1):
+              quick_fill_threshold=1.0):
 
         predicted_mask = np.zeros(state.shape)
         predictions = np.zeros(state.shape)
@@ -274,7 +330,7 @@ class GoLModule(nn.Module):
 
         video_out = None
         for i in range(total_runs):
-            sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=5*2)
+            sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=OUTLINE_SIZE)
             batch_input = torch.from_numpy(np.expand_dims(sample_input, 0)).float().to(device)
             if quick_fill_threshold < 1:
                 thr_guess = self.get_best_by_threshold(batch_input, predicted_mask, threshold=quick_fill_threshold)
@@ -426,6 +482,10 @@ def improve_submission():
 
     # loop through examples
     start_time = time.time()
+    batch_size = 64
+    stop_states = np.zeros((batch_size, 25, 25), dtype=np.int)
+    indices = np.zeros(batch_size, dtype=np.int)
+    current_sample_idx = 0
     for i in range(len(submission_values)):
 
         # ignore if errors are already zero
@@ -437,29 +497,39 @@ def improve_submission():
         stop_state = input_values[i][2:].reshape((25, 25))
 
         # skipping if wanted
-        if delta > 1:
+        if delta != 2:
+            continue
+
+        indices[current_sample_idx] = i
+        stop_states[current_sample_idx] = stop_state
+        current_sample_idx = (current_sample_idx + 1) % batch_size
+        if current_sample_idx != 0:
             continue
 
         print("\nRow {} with delta {} has old score: {}".format(i + 1, delta, old_score))
 
-        # -------------------
-        # do the prediction
-        # -------------------
+        # ------------------------
+        # do the single prediction
+        # ------------------------
 
-        pred_start_state = net.solve(stop_state, device)
-
-        # -------------------
-
-        pred_end_state = pred_start_state.copy()
+        pred_start_states = stop_states
         for d in range(delta):
-            pred_end_state = state_step(pred_end_state)
+            pred_start_states = net.solve_batch(pred_start_states, device)
 
-        new_score = np.sum(np.abs(pred_end_state - stop_state))
-        if new_score < old_score:
-            print("Improved from {} to {}!".format(old_score, new_score))
-            submission_values[i, 1:] = pred_start_state.reshape((-1,))
-            scores_values[i] = new_score
-            print("Mean error is now {}".format(np.mean(scores_values, dtype=np.float) / (25 * 25)))
+        # -------------------
+
+        for index, pred_start_state, stop_state in zip(indices, pred_start_states, stop_states):
+            pred_end_state = pred_start_state.copy()
+            for d in range(delta):
+                pred_end_state = state_step(pred_end_state)
+
+            new_score = np.sum(np.abs(pred_end_state - stop_state))
+            old_score = scores_values[index][0]
+            if new_score < old_score:
+                print("Improved from {} to {}!".format(old_score, new_score))
+                submission_values[index, 1:] = pred_start_state.reshape((-1,))
+                scores_values[index] = new_score
+                print("Mean error is now {}".format(np.mean(scores_values, dtype=np.float) / (25 * 25)))
 
         print("Estimated time left until finished: {} seconds".format(int((time.time() - start_time) * (len(submission_values) - i - 1) / (i + 1))))
 
@@ -479,7 +549,7 @@ def improve_submission():
 def train():
     device = torch.device('cuda')
 
-    dataset = GoLDataset(size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=5*2)
+    dataset = GoLDataset(size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=OUTLINE_SIZE)
     loader = DataLoader(dataset,
                         batch_size=BATCH_SIZE,
                         num_workers=1,
@@ -489,7 +559,7 @@ def train():
     print('Num parameters: {}'.format(net.get_num_trainable_parameters()))
     net.to(device)
     optimizer = optim.Adam(net.parameters(), lr=LR)
-    cel = nn.CrossEntropyLoss()
+    cel = nn.CrossEntropyLoss(reduction='none')
 
     train_writer = SummaryWriter(log_dir=TENSORBOARD_LOGS_DIR + '/' + RUN_NAME, comment=RUN_NAME)
 
@@ -502,9 +572,10 @@ def train():
             net.zero_grad()
             torch_input = batch['input'].float().to(device)
             torch_target = batch['target'].long().to(device)
+            torch_mask = batch['mask'].float().to(device)
             prediction = net(torch_input)
             # weight_loss = net.get_l2_loss_of_parameters()
-            classification_loss = cel(prediction, torch_target)
+            classification_loss = torch.mean(cel(prediction, torch_target) * torch_mask)
             loss = classification_loss  # weight_loss + classification_loss
 
             loss.backward()
@@ -519,14 +590,14 @@ def train():
 
             total_steps += 1
 
-        print("Create test video")
+        # print("Create test video")
         net.eval()
-        display_sample = create_training_sample()
-        net.solve(display_sample['end'],
-                  device,
-                  display_sample['start'],
-                  video_fname='{}/epoch_{:03}.avi'.format(VIDEO_DIR, epoch + 1)
-                  )
+        # display_sample = create_training_sample()
+        # net.solve(display_sample['end'],
+        #           device,
+        #           display_sample['start'],
+        #           video_fname='{}/epoch_{:03}.avi'.format(VIDEO_DIR, epoch + 1)
+        #           )
 
         print("Calculate epoch loss")
         epoch_loss = 0
