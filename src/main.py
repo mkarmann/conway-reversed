@@ -497,7 +497,7 @@ def improve_submission():
         stop_state = input_values[i][2:].reshape((25, 25))
 
         # skipping if wanted
-        if delta != 2:
+        if delta != 5:
             continue
 
         indices[current_sample_idx] = i
