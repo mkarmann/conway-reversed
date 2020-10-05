@@ -4,6 +4,10 @@ import math
 import cv2
 import numpy as np
 import matplotlib
+import random
+
+from stochastic_optimizer import BestChangeLayer
+
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import time
@@ -445,6 +449,8 @@ def test():
 
 def improve_submission():
 
+    DELTA = 5
+
     if not os.path.isdir(SUBMISSION_DIR):
         os.makedirs(SUBMISSION_DIR)
 
@@ -473,10 +479,13 @@ def improve_submission():
     # -------------------
 
     device = torch.device('cuda')
-    net = GoLModule()
-    net.load_state_dict(torch.load('../out/training/snapshots/2020_09_25_18_51_41_GoL_delta_1/epoch_103.pt'))
-    net.eval()
-    net.to(device)
+    # net = GoLModule()
+    # net.load_state_dict(torch.load('../out/training/snapshots/2020_09_25_18_51_41_GoL_delta_1/epoch_103.pt'))
+    # net.eval()
+    # net.to(device)
+    bcls = [
+        BestChangeLayer(window=(3, 3), delta=DELTA, device=device)
+    ]
 
     # -------------------
 
@@ -497,7 +506,7 @@ def improve_submission():
         stop_state = input_values[i][2:].reshape((25, 25))
 
         # skipping if wanted
-        if delta != 5:
+        if delta != DELTA:
             continue
 
         indices[current_sample_idx] = i
@@ -511,10 +520,11 @@ def improve_submission():
         # ------------------------
         # do the single prediction
         # ------------------------
-
         pred_start_states = stop_states
-        for d in range(delta):
-            pred_start_states = net.solve_batch(pred_start_states, device)
+        bcl = random.choice(bcls)
+        pred_start_states = bcl.solve_batch(pred_start_states, device, num_steps=3000)
+        # for d in range(delta):
+        #     pred_start_states = net.solve_batch(pred_start_states, device)
 
         # -------------------
 

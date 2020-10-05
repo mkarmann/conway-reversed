@@ -4,8 +4,6 @@ import torch
 import matplotlib.pyplot as plt
 import torch.nn as nn
 
-from main import create_training_sample, state_loss, state_step
-
 matplotlib.use('TkAgg')
 
 
@@ -55,8 +53,9 @@ class TilePad2d(nn.Module):
 
 
 class BestChangeLayer(nn.Module):
-    def __init__(self, delta=1, window=(3, 3)):
+    def __init__(self, delta=1, window=(3, 3), device=torch.device('cpu')):
         super().__init__()
+        self.device = device
         self.window = window
         self.influence_window = (window[0] + 4 * delta, window[1] + 4 * delta)
         self.delta = delta
@@ -74,9 +73,9 @@ class BestChangeLayer(nn.Module):
         self.possible_inputs_values = np.zeros((1, self.num_possible_window_inputs, self.influence_window[0], self.influence_window[1]), dtype=np.float)
         self.possible_inputs_values[:, :, 2*delta:-2*delta, 2*delta:-2*delta] = self.possible_inputs
 
-        self.pi = torch.from_numpy(self.possible_inputs)
-        self.pi_window = torch.from_numpy(self.possible_inputs_values)
-        self.pi_window_mask = torch.from_numpy(self.possible_inputs_mask)
+        self.pi = torch.from_numpy(self.possible_inputs).float().to(device)
+        self.pi_window = torch.from_numpy(self.possible_inputs_values).float().to(device)
+        self.pi_window_mask = torch.from_numpy(self.possible_inputs_mask).float().to(device)
         self.pi_window_inv_mask = -self.pi_window_mask + 1
 
         self.replication_input_layer = TilePad2d(
@@ -95,8 +94,8 @@ class BestChangeLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, target: torch.Tensor):
 
-        random_x = np.random.randint(0, x.size()[3] - self.window[1] + 1)
-        random_y = np.random.randint(0, x.size()[2] - self.window[0] + 1)
+        random_x = np.random.randint(0, x.size()[3])
+        random_y = np.random.randint(0, x.size()[2])
 
         influence_window = self.replication_input_layer(x)[:, :, random_y:(random_y + self.influence_window[0]), random_x:(random_x + self.influence_window[1])]
         target_window = self.replication_target_layer(target)[:, :, random_y:(random_y + self.window[0] + 2 * self.delta), random_x:(random_x + self.window[1] + 2 * self.delta)]
@@ -107,35 +106,47 @@ class BestChangeLayer(nn.Module):
             end = conway_layer(end)[:, :, 1:-1, 1:-1]
 
         errors = torch.sum(torch.abs(end - target_window.repeat(1, self.num_possible_window_inputs, 1, 1)), (2, 3))
-        seeded_errors = errors + torch.rand(errors.size()) * 0.5
+        seeded_errors = errors + torch.rand(errors.size(), device=self.device) * 0.5
 
         indices = torch.argmin(seeded_errors, 1)
-        best_mask = self.unpool(torch.ones((seeded_errors.size()[0], 1, 1)), indices.reshape(-1, 1, 1)).reshape(-1, self.num_possible_window_inputs, 1, 1)
+        best_mask = self.unpool(torch.ones((seeded_errors.size()[0], 1, 1), device=self.device), indices.reshape(-1, 1, 1)).reshape(-1, self.num_possible_window_inputs, 1, 1)
         best_inputs = torch.sum(self.pi * best_mask, 1).reshape((-1, 1, self.window[0], self.window[1]))
 
-        out = x.clone()
-        out[:, :, random_y:(random_y + self.window[0]), random_x:(random_x + self.window[1])] = best_inputs
+        out = torch.roll(x, shifts=(-random_y, -random_x), dims=(2, 3))
+        out[:, :, :self.window[0], :self.window[1]] = best_inputs
+        out = torch.roll(out, shifts=(random_y, random_x), dims=(2, 3))
 
         return out
 
+    def solve_batch(self, states: np.array, device: torch.device, num_steps=1000):
+        target_batch = torch.from_numpy(states).reshape(states.shape[0], 1, states.shape[1], states.shape[2]).float().to(device)
+        inputs_batch = torch.sign(torch.rand(target_batch.size(), device=device).float() - 0.5) * 0.5 + 0.5
+
+        for i in range(num_steps):
+            inputs_batch = self(inputs_batch, target_batch)
+
+        return np.clip(np.rint(np.array(inputs_batch.tolist())).astype(np.int), 0, 1).reshape(states.shape)
+
 
 def main():
-    DELTA = 5
+    DELTA = 1
     STEPS = 2000
+
+    device = torch.device('cuda')
 
     sample = create_training_sample(delta=DELTA)
     batch_target = np.expand_dims(np.expand_dims(sample['end'], 0), 3)
     batch_sample_start = np.expand_dims(np.expand_dims(sample['start'], 0), 3)
-    batch_target_torch = torch.from_numpy(batch_target.transpose((0, 3, 1, 2))).float()
-    batch_sample_start_torch = torch.from_numpy(batch_sample_start.transpose((0, 3, 1, 2))).float()
+    batch_target_torch = torch.from_numpy(batch_target.transpose((0, 3, 1, 2))).float().to(device)
+    batch_sample_start_torch = torch.from_numpy(batch_sample_start.transpose((0, 3, 1, 2))).float().to(device)
 
     # analytic_start_state = torch.zeros(batch_target_torch.size()).float()
-    analytic_start_state = torch.sign(torch.rand(batch_target_torch.size()).float() - 0.5) * 0.5 + 0.5
+    analytic_start_state = torch.sign(torch.rand(batch_target_torch.size(), device=device).float() - 0.5) * 0.5 + 0.5
     # analytic_start_state = batch_target_torch
     # plot(sample['start'])
     # plot(sample['end'])
 
-    bcl = BestChangeLayer(delta=DELTA)
+    bcl = BestChangeLayer(delta=DELTA, device=device)
     loss = torch.sum(torch.abs(batch_target_torch - conway_layer(analytic_start_state)))
     print(loss.item())
     for step in range(STEPS):
