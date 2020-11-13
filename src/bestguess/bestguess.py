@@ -1,3 +1,5 @@
+import gc
+
 import pandas as pd
 import math
 
@@ -7,8 +9,8 @@ import matplotlib
 import random
 
 from stochastic_optimizer import BestChangeLayer
-
-# matplotlib.use('agg')
+from tensorboard.backend.event_processing import event_accumulator
+matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import time
 import torch
@@ -19,20 +21,21 @@ from torch import optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-
+MODEL_CHANNELS = 16 * 6
 LR = 1e-4
-BATCH_SIZE = 128
-STEPS_PER_EPOCH = 1024
-EPOCHS = 128
-GOL_DELTA = 2
-TEST_SAMPLES = 20
-HALF_LR_AFTER_N_EPOCHS = 32
-OUTLINE_SIZE = 5*2
-RUN_NAME = time.strftime("%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(GOL_DELTA)
-SNAPSHOTS_DIR = '../out/training/snapshots/{}'.format(RUN_NAME)
-TENSORBOARD_LOGS_DIR = '../out/training/logs'
-VIDEO_DIR = '../out/training/videos/{}'.format(RUN_NAME)
-SUBMISSION_DIR = '../out/submissions'
+BATCH_SIZE = 32         # normally 64
+BATCHES_PER_STEP = 2
+STEPS_PER_EPOCH = 1000
+EPOCHS = 30
+TEST_BATCHES = 4
+TEST_SAMPLES_PER_BATCH = 16
+TEST_SAMPLES = TEST_BATCHES * TEST_SAMPLES_PER_BATCH
+HALF_LR_AFTER_N_EPOCHS = 10
+RUN_NAME = str(MODEL_CHANNELS) + time.strftime("___%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(1)
+SNAPSHOTS_DIR = '../../best_guess/out/training/snapshots/{}'.format(RUN_NAME)
+TENSORBOARD_LOGS_DIR = '../../best_guess/out/training/logs'
+VIDEO_DIR = '../../best_guess/out/training/videos/{}'.format(RUN_NAME)
+SUBMISSION_DIR = '../../best_guess/out/submissions'
 SUBMISSION_FILE_FORMAT = SUBMISSION_DIR + '/submission_{}.csv'
 SCORE_FILE_FORMAT = SUBMISSION_DIR + '/score_{}.csv'
 
@@ -65,21 +68,17 @@ def plot(state: np.array):
 def create_random_board(shape=(25, 25), warmup_steps=5):
     factor = np.random.uniform(0.01, 0.99, (1, ))
     state = (np.random.uniform(0.0, 1.0, shape) > factor).astype(np.int)
-
     for i in range(warmup_steps):
         state = state_step(state)
-
     return state
 
 
-def create_training_sample(shape=(25, 25), warmup_steps=5, delta=GOL_DELTA, random_warmup=False):
-
+def create_training_sample(shape=(25, 25), warmup_steps=5, delta=1, random_warmup=False):
     while True:
         start = create_random_board(shape, warmup_steps + (np.random.randint(0, 5) if random_warmup else 0))
         end = start.copy()
         for i in range(delta):
             end = state_step(end)
-
         if np.any(end):
             return {
                 "start": start,
@@ -88,24 +87,59 @@ def create_training_sample(shape=(25, 25), warmup_steps=5, delta=GOL_DELTA, rand
             }
 
 
-class ResBlock(nn.Module):
+class TiledConv2d(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.conv00 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
+        self.conv01 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
+        self.conv02 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
+        self.conv10 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
+        self.conv11 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
+        self.conv12 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
+        self.conv20 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
+        self.conv21 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
+        self.conv22 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
+
+    def forward(self, x):
+        return \
+            self.conv00(torch.roll(x, (-1, -1), dims=(2, 3))) + \
+            self.conv01(torch.roll(x, (-1, 0), dims=(2, 3))) + \
+            self.conv02(torch.roll(x, (-1, 1), dims=(2, 3))) + \
+            self.conv10(torch.roll(x, (0, -1), dims=(2, 3))) + \
+            self.conv11(torch.roll(x, (0, 0), dims=(2, 3))) + \
+            self.conv12(torch.roll(x, (0, 1), dims=(2, 3))) + \
+            self.conv20(torch.roll(x, (1, -1), dims=(2, 3))) + \
+            self.conv21(torch.roll(x, (1, 0), dims=(2, 3))) + \
+            self.conv22(torch.roll(x, (1, 1), dims=(2, 3)))
+
+
+class TiledResBlock(nn.Module):
     def __init__(self, features):
         super().__init__()
-
         self.main = nn.Sequential(
             nn.BatchNorm2d(features),
             nn.ReLU(True),
-            nn.Conv2d(features, features // 4, 3, padding=0, bias=False),
-            nn.BatchNorm2d(features // 4),
+            TiledConv2d(features, features),
+            nn.BatchNorm2d(features),
             nn.ReLU(True),
-            nn.Conv2d(features // 4, features, 1, padding=0,  bias=False)
+            TiledConv2d(features, features)
         )
 
     def forward(self, x):
-        return self.main(x) + x[:, :, 1:-1, 1:-1]
+        return self.main(x) + x
 
 
-def create_net_input_array(state: np.array, predicted_mask: np.array, predictions: np.array, outline_size=0):
+def best_guess_block(input_channels, channels):
+    return nn.Sequential(
+        nn.Conv2d(input_channels, channels, 1, bias=False),
+        TiledResBlock(channels),
+        TiledResBlock(channels),
+        nn.BatchNorm2d(channels),
+        nn.ReLU(True),
+    )
+
+
+def create_net_input_array(state: np.array, predicted_mask: np.array, predictions: np.array):
     input_dead = (1 - state).astype(np.float)
     input_alive = state.astype(np.float)
     input_unpredicted = (1 - predicted_mask).astype(np.float)
@@ -120,42 +154,20 @@ def create_net_input_array(state: np.array, predicted_mask: np.array, prediction
         axis=2
     )
 
-    # plt.subplot(2, 1, 1)
-    # plt.imshow(sample_input[:, :, 0])
-
-    # outlining
-    if outline_size > 0:
-        tiles_y = ((outline_size - 1) // state.shape[0]) * 2 + 2 + 1
-        tiles_x = ((outline_size - 1) // state.shape[1]) * 2 + 2 + 1
-        offset_y = state.shape[0] - ((outline_size - 1) % state.shape[0]) - 1
-        offset_x = state.shape[1] - ((outline_size - 1) % state.shape[1]) - 1
-
-        sample_input = np.tile(sample_input, (tiles_y, tiles_x, 1))
-        sample_input = sample_input[
-                       offset_y:(offset_y + state.shape[0] + 2 * outline_size),
-                       offset_x:(offset_x + state.shape[1] + 2 * outline_size)
-                       ]
-
-    # plt.subplot(2, 1, 2)
-    # plt.imshow(sample_input[:, :, 0])
-    # plt.show()
-
     return sample_input.transpose((2, 0, 1)).astype(np.float)
 
 
-class GoLDataset(Dataset):
-    def __init__(self, shape=(25, 25), warmup_steps=5, delta=GOL_DELTA, size=1024, outline_size=0):
+class BestGuessDataset(Dataset):
+    def __init__(self, shape=(25, 25), warmup_steps=5, dataset_size=1024):
         self.shape = shape
         self.warmup_steps = warmup_steps
-        self.delta = delta
-        self.size = size
-        self.outline_size = outline_size
+        self.dataset_size = dataset_size
 
     def __len__(self):
-        return self.size
+        return self.dataset_size
 
     def __getitem__(self, idx):
-        sample = create_training_sample(self.shape, self.warmup_steps, self.delta, random_warmup=True)
+        sample = create_training_sample(self.shape, self.warmup_steps, 1, random_warmup=True)
         start = sample["start"]
         end = sample["end"]
         predicted_mask = (np.random.uniform(0.0, 1.0, self.shape) > np.random.uniform(0.0, 1.0, (1, ))).astype(np.int)
@@ -164,41 +176,22 @@ class GoLDataset(Dataset):
         if np.sum(predicted_mask) == self.shape[0] * self.shape[1]:
             predicted_mask[np.random.randint(0, self.shape[0], (1, )), np.random.randint(0, self.shape[1], (1, ))] = 0
 
-        sample_input = create_net_input_array(end, predicted_mask, start, outline_size=self.outline_size)
-
-        sample_target = start
-
         return {
-            "input": sample_input,
+            "input": create_net_input_array(end, predicted_mask, start),
             "mask": np.expand_dims(predicted_mask.astype(np.float), 3).transpose((2, 0, 1)),
-            "target": sample_target
+            "target": start
         }
 
 
-class GoLModule(nn.Module):
+class BestGuessModule(nn.Module):
     def __init__(self, channels=128):
         super().__init__()
 
         self.main = nn.Sequential(
-            nn.Conv2d(5, channels, 1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(True),
-            nn.Conv2d(channels, channels, 1, bias=False),
-            ResBlock(channels),
-            ResBlock(channels),
-            ResBlock(channels),
-            ResBlock(channels),
-            ResBlock(channels),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(True),
-            nn.Conv2d(channels, channels, 1, bias=False),
-            ResBlock(channels),
-            ResBlock(channels),
-            ResBlock(channels),
-            ResBlock(channels),
-            ResBlock(channels),
-            nn.BatchNorm2d(channels),
-            nn.Conv2d(channels, 2, 1)
+            best_guess_block(5, channels),
+            best_guess_block(channels, channels * 2),
+            best_guess_block(channels * 2, channels * 4),
+            nn.Conv2d(channels * 4, 2, 1)
         )
 
     def get_num_trainable_parameters(self):
@@ -263,7 +256,7 @@ class GoLModule(nn.Module):
     def solve_pure_gpu(self, state: np.array, device: torch.device):
         predicted_mask = np.zeros(state.shape)
         predictions = np.zeros(state.shape)
-        sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=OUTLINE_SIZE)
+        sample_input = create_net_input_array(state, predicted_mask, predictions)
         batch_input = torch.from_numpy(np.expand_dims(sample_input, 0)).float().to(device)
 
         for i in range(state.shape[0] * state.shape[1]):
@@ -272,49 +265,26 @@ class GoLModule(nn.Module):
 
             # batch_input[:, ]
 
-    def solve_batch(self, states: np.array, device: torch.device, best_guesses_per_sample=1):
+    def solve_batch(self, states: np.array, device: torch.device):
         predicted_masks = np.zeros(states.shape)
         predictions = np.zeros(states.shape)
         batches_indices = np.arange(0, states.shape[0])
 
         total_runs = states.shape[1] * states.shape[2]
-        sample_inputs = np.zeros((states.shape[0], 5, states.shape[1] + 2 * OUTLINE_SIZE, states.shape[2] + 2 * OUTLINE_SIZE), dtype=np.float)
+        sample_inputs = np.zeros((states.shape[0], 5, states.shape[1], states.shape[2]), dtype=np.float)
 
         for i in range(total_runs):
             for b in range(states.shape[0]):
-                sample_inputs[b] = create_net_input_array(states[b], predicted_masks[b], predictions[b], outline_size=OUTLINE_SIZE)
+                sample_inputs[b] = create_net_input_array(states[b], predicted_masks[b], predictions[b])
+
             input_tensor = torch.from_numpy(sample_inputs).float().to(device)
+            probabilities = self.get_probabilities(input_tensor)
+            masked_probabilities = np.array(probabilities.tolist()) * (1 - predicted_masks.reshape((-1, 1, states.shape[1], states.shape[2])))
+            maxes = np.argmax(masked_probabilities.reshape((-1, 2 * states.shape[1] * states.shape[2])), axis=1)
+            guesses = np.unravel_index(maxes, probabilities.shape)
+            predicted_masks[batches_indices, guesses[2], guesses[3]] = 1
+            predictions[batches_indices, guesses[2], guesses[3]] = guesses[1]
 
-
-            if best_guesses_per_sample == 1 or i > total_runs // 2:
-
-                # only chose the best guess
-                probabilities = self.get_probabilities(input_tensor)
-                masked_probabilities = np.array(probabilities.tolist()) * (1 - predicted_masks.reshape((-1, 1, states.shape[1], states.shape[2])))
-                maxes = np.argmax(masked_probabilities.reshape((-1, 2 * states.shape[1] * states.shape[2])), axis=1)
-                guesses = np.unravel_index(maxes, probabilities.shape)
-                predicted_masks[batches_indices, guesses[2], guesses[3]] = 1
-                predictions[batches_indices, guesses[2], guesses[3]] = guesses[1]
-
-            else:
-
-                num_best_guesses = min(best_guesses_per_sample, total_runs - i)
-
-                # select between multiple best guesses
-                probabilities = self.get_probabilities(input_tensor)
-                masked_probabilities = np.array(probabilities.tolist()) * (
-                            1 - predicted_masks.reshape((-1, 1, states.shape[1], states.shape[2])))
-                maxes_all = np.zeros((states.shape[0], num_best_guesses), dtype=np.int)
-                mkp = masked_probabilities.reshape((-1, 2 * states.shape[1] * states.shape[2]))
-                for g in range(num_best_guesses):
-                    maxes = np.argmax(mkp, axis=1)
-                    maxes_all[:, g] = maxes
-                    mkp[batches_indices, maxes] = 0
-
-                maxes = maxes_all[:, np.random.randint(0, num_best_guesses, states.shape[0])]
-                guesses = np.unravel_index(maxes, probabilities.shape)
-                predicted_masks[batches_indices, guesses[2], guesses[3]] = 1
-                predictions[batches_indices, guesses[2], guesses[3]] = guesses[1]
         return predictions
 
     def solve(self,
@@ -333,7 +303,7 @@ class GoLModule(nn.Module):
 
         video_out = None
         for i in range(total_runs):
-            sample_input = create_net_input_array(state, predicted_mask, predictions, outline_size=OUTLINE_SIZE)
+            sample_input = create_net_input_array(state, predicted_mask, predictions)
             batch_input = torch.from_numpy(np.expand_dims(sample_input, 0)).float().to(device)
             if quick_fill_threshold < 1:
                 thr_guess = self.get_best_by_threshold(batch_input, predicted_mask, threshold=quick_fill_threshold)
@@ -379,9 +349,9 @@ class GoLModule(nn.Module):
                 sub.imshow(predictions.astype(np.float))
                 sub.imshow(overlay, vmin=0.0, vmax=1.0)
                 sub = fig.add_subplot(2, 3, 5)
-                sub.set_title("prediction after {} steps".format(GOL_DELTA))
+                sub.set_title("prediction after {} steps".format(1))
                 outc = predictions
-                for d in range(GOL_DELTA):
+                for d in range(1):
                     outc = state_step(outc)
                 sub.imshow(outc.astype(np.float))
 
@@ -412,161 +382,84 @@ class GoLModule(nn.Module):
 
 
 def test():
-    device = torch.device('cuda')
-    net = GoLModule()
-    net.load_state_dict(torch.load('../out/training/snapshots/2020_09_25_18_51_41_GoL_delta_1/epoch_103.pt'))
-    net.eval()
-    net.to(device)
 
-    df_input = pd.read_csv("../input/test.csv")
-    input_values = df_input.values
+    model_fnames = []
+    log_fnames = []
+    num_channels = []
+    for fname in os.walk(os.path.dirname(SNAPSHOTS_DIR)):
+        model_fname = fname[0] + '\epoch_030.pt'
+        if os.path.exists(model_fname):
+            run_name = os.path.split(fname[0])[1]
+            model_fnames.append(model_fname)
+            num_channels.append(int(run_name.split('___')[0]))
 
-    error_sum = 0
-    for i in range(100):
-        delta = input_values[i][1]
-        end_state = input_values[i][2:].reshape((25, 25))
-        gt_states = [end_state]
-        for d in range(delta):
-            gt_states.append(state_step(gt_states[-1]))
+            log_files = next(os.walk('{}/{}'.format(TENSORBOARD_LOGS_DIR, run_name)))
+            log_fnames.append(os.path.join(log_files[0], log_files[2][0]))
 
-        current_solve = end_state
-        for d in range(delta):
-            prev_solve = current_solve.copy()
-            current_solve = net.solve(current_solve, device)      # video_fname='out/vid_out_{}.avi'.format(d + 1))
-
-        # check error
-        outc = current_solve
-        for d in range(delta):
-            outc = state_step(outc)
-        c_error = state_loss(outc, end_state)
-        print('Error d{}: {}'.format(delta, c_error))
-
-        error_sum += c_error
-        print("Moving avg: {}\n".format(error_sum / (i + 1)))
-    print('\nMean Error: {}'.format(error_sum / 100))
-
-
-def improve_submission():
-
-    DELTA = 5
-
-    if not os.path.isdir(SUBMISSION_DIR):
-        os.makedirs(SUBMISSION_DIR)
-
-    submission_id = 0
-    while os.path.exists(SUBMISSION_FILE_FORMAT.format(submission_id)):
-        submission_id += 1
-
-    if submission_id == 0:
-        df_submission = pd.read_csv("../input/sample_submission.csv")
-        df_scores = pd.DataFrame(np.ones(len(df_submission), dtype=np.int) * 25 * 25, columns=["num_wrong_cells"])
-    else:
-        df_submission = pd.read_csv(SUBMISSION_FILE_FORMAT.format(submission_id - 1))
-        df_scores = pd.read_csv(SCORE_FILE_FORMAT.format(submission_id - 1))
-
-    input_csv = "../input/test.csv"
-    df_input = pd.read_csv(input_csv)
-    input_values = np.array(df_input.values)
-    scores_values = np.array(df_scores.values)
-    submission_values = np.array(df_submission.values)
-
-    to_check_rows = np.sum(scores_values > 0)
-    print("To check rows: {}".format(to_check_rows))
-
-    # -------------------
-    # init models
-    # -------------------
+    training_hours = []
+    for log_fname in log_fnames:
+        ea = event_accumulator.EventAccumulator(log_fname)
+        ea.Reload()
+        loss_train = ea.Scalars('loss/train')
+        training_hours.append((loss_train[-1].wall_time - loss_train[0].wall_time) / 60 / 60)
 
     device = torch.device('cuda')
-    # net = GoLModule()
-    # net.load_state_dict(torch.load('../out/training/snapshots/2020_09_25_18_51_41_GoL_delta_1/epoch_103.pt'))
-    # net.eval()
-    # net.to(device)
-    bcls = [
-        BestChangeLayer(window=(4, 3), delta=DELTA, device=device)
-    ]
+    num_test_batches = 8
+    test_batch_size = 16
+    end_states = np.array([create_training_sample(random_warmup=True)['end'] for _ in range(num_test_batches * test_batch_size)]).reshape((num_test_batches, test_batch_size, 25, 25))
+    means = []
+    stds = []
+    num_parameters = []
+    for model_fname, channel_count in zip(model_fnames, num_channels):
+        print('Testing {}'.format(model_fname))
+        net = BestGuessModule(channel_count)
+        net.load_state_dict(torch.load(model_fname))
+        num_parameters.append(net.get_num_trainable_parameters())
+        net.eval()
+        net.to(device)
 
-    # -------------------
+        losses = []
+        for batch in end_states:
+            predicted_starts = net.solve_batch(batch, device)
+            # predicted_starts = batch
 
-    # loop through examples
-    start_time = time.time()
-    batch_size = 63
-    stop_states = np.zeros((batch_size, 25, 25), dtype=np.int)
-    indices = np.zeros(batch_size, dtype=np.int)
-    current_sample_idx = 0
-    for i in range(len(submission_values)):
+            for ps, b in zip(predicted_starts, batch):
+                losses.append(state_loss(state_step(ps), b))
+        losses = np.array(losses, dtype=np.float)
+        print('Mean error in percent: {:.3f}%'.format(np.mean(losses) * 100))
+        means.append(np.mean(losses))
+        stds.append(np.std(losses))
+        del net
 
-        # ignore if errors are already zero
-        old_score = scores_values[i][0]
-        if old_score == 0:
-            continue
-
-        delta = input_values[i][1]
-        stop_state = input_values[i][2:].reshape((25, 25))
-
-        plot(stop_state)
-
-        # skipping if wanted
-        if delta != DELTA:
-            continue
-
-        indices[current_sample_idx] = i
-        stop_states[current_sample_idx] = stop_state
-        current_sample_idx = (current_sample_idx + 1) % batch_size
-        if current_sample_idx != 0:
-            continue
-
-        print("\nRow {} with delta {} has old score: {}".format(i + 1, delta, old_score))
-
-        # ------------------------
-        # do the single prediction
-        # ------------------------
-        pred_start_states = stop_states
-        bcl = random.choice(bcls)
-        pred_start_states = bcl.solve_batch(pred_start_states, device, num_steps=2000)
-        # for d in range(delta):
-        #     pred_start_states = net.solve_batch(pred_start_states, device)
-
-        # -------------------
-
-        for index, pred_start_state, stop_state in zip(indices, pred_start_states, stop_states):
-            pred_end_state = pred_start_state.copy()
-            for d in range(delta):
-                pred_end_state = state_step(pred_end_state)
-
-            new_score = np.sum(np.abs(pred_end_state - stop_state))
-            old_score = scores_values[index][0]
-            if new_score < old_score:
-                print("Improved from {} to {}!".format(old_score, new_score))
-                submission_values[index, 1:] = pred_start_state.reshape((-1,))
-                scores_values[index] = new_score
-                print("Mean error is now {}".format(np.mean(scores_values, dtype=np.float) / (25 * 25)))
-
-        print("Estimated time left until finished: {} seconds".format(int((time.time() - start_time) * (len(submission_values) - i - 1) / (i + 1))))
-
-    print("\n------------------------")
-    print("Mean error is now {}".format(np.mean(scores_values) / (25 * 25)))
-    print("Rows left to check: {}".format(np.sum(scores_values > 0)))
-    print("Writing files...")
-
-    df_submission = pd.DataFrame(data=submission_values, columns=list(df_submission.columns.values))
-    df_scores = pd.DataFrame(data=scores_values, columns=list(df_scores.columns.values))
-    df_submission.to_csv(SUBMISSION_FILE_FORMAT.format(submission_id), index=False)
-    df_scores.to_csv(SCORE_FILE_FORMAT.format(submission_id), index=False)
-
-    print("Done!")
+    print('    \\begin{tabular}{rlllll}')
+    print('        \\toprule')
+    print('        ~ & ~ & ~ & ~ & \\multicolumn{2}{c}{Fehlerquote}\\\\')
+    print('        \\cmidrule{5-6}')
+    print('        Name & Channels & Parameter & Training & Durchsch. & Varianz\\\\')
+    print('        \\midrule')
+    for channel_count, mean, std, parameters, hours in zip(num_channels, means, stds, num_parameters, training_hours):
+        print('        {} & ${}$ & ${:.1f}$ Mio. & ${:.1f}$ Std. & ${:.2f}\\%$ & ${:.2f}$ \\\\'.format(
+            'bg{}'.format(channel_count),
+            channel_count,
+            parameters / 1000000,
+            hours,
+            mean * 100,
+            std * 100
+        ))
+    print('        \\bottomrule')
+    print('    \\end{tabular}')
 
 
 def train():
     device = torch.device('cuda')
 
-    dataset = GoLDataset(size=STEPS_PER_EPOCH * BATCH_SIZE, outline_size=OUTLINE_SIZE)
+    dataset = BestGuessDataset(dataset_size=STEPS_PER_EPOCH * BATCH_SIZE * BATCHES_PER_STEP)
     loader = DataLoader(dataset,
                         batch_size=BATCH_SIZE,
                         num_workers=1,
                         pin_memory=True)
 
-    net = GoLModule()
+    net = BestGuessModule(channels=MODEL_CHANNELS)
     print('Num parameters: {}'.format(net.get_num_trainable_parameters()))
     net.to(device)
     optimizer = optim.Adam(net.parameters(), lr=LR)
@@ -578,31 +471,33 @@ def train():
     for epoch in range(EPOCHS):
         batch_iter = iter(loader)
         for step in range(STEPS_PER_EPOCH):
-            batch = next(batch_iter)
-
             net.zero_grad()
-            torch_input = batch['input'].float().to(device)
-            torch_target = batch['target'].long().to(device)
-            torch_mask = batch['mask'].float().to(device)
-            prediction = net(torch_input)
-            # weight_loss = net.get_l2_loss_of_parameters()
-            classification_loss = torch.mean(cel(prediction, torch_target) * torch_mask)
-            loss = classification_loss  # weight_loss + classification_loss
 
-            loss.backward()
+            for sub_step in range(BATCHES_PER_STEP):
+                batch = next(batch_iter)
+
+                torch_input = batch['input'].float().to(device)
+                torch_target = batch['target'].long().to(device)
+                torch_mask = batch['mask'].float().to(device)
+                prediction = net(torch_input)
+                weight_loss = net.get_l2_loss_of_parameters()
+                classification_loss = torch.mean(cel(prediction, torch_target) * torch_mask)
+                loss = (weight_loss + classification_loss) * (1. / BATCHES_PER_STEP)
+
+                loss.backward()
             optimizer.step()
 
             if step % 16 == 0:
                 loss_item = loss.item()
                 print('Epoch {} - Step {} - loss {:.5f}'.format(epoch + 1, step + 1, loss_item))
-                # train_writer.add_scalar('loss/weights-l2', weight_loss.item(), total_steps)
+                train_writer.add_scalar('loss/weights-l2', weight_loss.item(), total_steps)
                 train_writer.add_scalar('loss/class-ce', classification_loss.item(), total_steps)
                 train_writer.add_scalar('loss/train', loss_item, total_steps)
 
             total_steps += 1
 
-        # print("Create test video")
         net.eval()
+        # print("Create test video")
         # display_sample = create_training_sample()
         # net.solve(display_sample['end'],
         #           device,
@@ -612,15 +507,14 @@ def train():
 
         print("Calculate epoch loss")
         epoch_loss = 0
-        for t in range(TEST_SAMPLES):
-            test_sample = create_training_sample(random_warmup=True)
-            res = net.solve(test_sample['end'], device)
-            outc = res
-            for d in range(GOL_DELTA):
-                outc = state_step(outc)
-            epoch_loss += np.mean(np.abs((outc - test_sample['end'])))
+        for n in range(TEST_BATCHES):
+            end_states = np.array([create_training_sample(random_warmup=True)['end'] for _ in range(TEST_SAMPLES_PER_BATCH)])
+            pred_start_states = net.solve_batch(end_states, device)
+            for end_state, pred_start_state in zip(end_states, pred_start_states):
+                pred_end_state = state_step(pred_start_state)
+                epoch_loss += state_loss(end_state, pred_end_state)
         epoch_loss /= TEST_SAMPLES
-        print("Epoch loss {}".format(epoch_loss))
+        print("Epoch test loss {}".format(epoch_loss))
         train_writer.add_scalar('loss/test', epoch_loss, total_steps)
         net.train()
 
@@ -639,4 +533,4 @@ def train():
 
 
 if __name__ == "__main__":
-    improve_submission()
+    test()
