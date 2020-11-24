@@ -4,6 +4,8 @@ import torch
 import matplotlib.pyplot as plt
 import torch.nn as nn
 
+# from main import create_training_sample, state_step
+
 matplotlib.use('TkAgg')
 
 
@@ -70,11 +72,11 @@ class BestChangeLayer(nn.Module):
 
         self.possible_inputs_mask = np.zeros((1, self.num_possible_window_inputs, self.influence_window[0], self.influence_window[1]), dtype=np.float)
         self.possible_inputs_mask[:, :, 2*delta:-2*delta, 2*delta:-2*delta] = 1
-        self.possible_inputs_values = np.zeros((1, self.num_possible_window_inputs, self.influence_window[0], self.influence_window[1]), dtype=np.float)
-        self.possible_inputs_values[:, :, 2*delta:-2*delta, 2*delta:-2*delta] = self.possible_inputs
+        self.possible_inputs_window = np.zeros((1, self.num_possible_window_inputs, self.influence_window[0], self.influence_window[1]), dtype=np.float)
+        self.possible_inputs_window[:, :, 2 * delta:-2 * delta, 2 * delta:-2 * delta] = self.possible_inputs
 
         self.pi = torch.from_numpy(self.possible_inputs).float().to(device)
-        self.pi_window = torch.from_numpy(self.possible_inputs_values).float().to(device)
+        self.pi_window = torch.from_numpy(self.possible_inputs_window).float().to(device)
         self.pi_window_mask = torch.from_numpy(self.possible_inputs_mask).float().to(device)
         self.pi_window_inv_mask = -self.pi_window_mask + 1
 
@@ -118,9 +120,12 @@ class BestChangeLayer(nn.Module):
 
         return out
 
-    def solve_batch(self, states: np.array, device: torch.device, num_steps=1000):
+    def solve_batch(self, states: np.array, device: torch.device, num_steps=1000, initial_states: np.array=None,):
         target_batch = torch.from_numpy(states).reshape(states.shape[0], 1, states.shape[1], states.shape[2]).float().to(device)
-        inputs_batch = torch.sign(torch.rand(target_batch.size(), device=device).float() - 0.5) * 0.5 + 0.5
+        if initial_states is None:
+            inputs_batch = torch.sign(torch.rand(target_batch.size(), device=device).float() - 0.5) * 0.5 + 0.5
+        else:
+            inputs_batch = torch.from_numpy(initial_states).reshape(states.shape[0], 1, states.shape[1], states.shape[2]).float().to(device)
 
         for i in range(num_steps):
             inputs_batch = self(inputs_batch, target_batch)
@@ -128,8 +133,28 @@ class BestChangeLayer(nn.Module):
         return np.clip(np.rint(np.array(inputs_batch.tolist())).astype(np.int), 0, 1).reshape(states.shape)
 
 
+def find_all_possible_inputs(window_size: np.ndarray):
+    num_bins = window_size[0] * window_size[1]
+    num_inputs = 2**num_bins
+    possible_inputs = np.zeros((num_inputs, num_bins), dtype=np.int)
+    for i in range(num_inputs):
+        possible_inputs[i] = np.array(list(np.binary_repr(i, num_bins)), dtype=np.float)
+    possible_inputs = possible_inputs.reshape((num_inputs, window_size[0], window_size[1]))
+    print('Num inputs: {}'.format(num_inputs))
+    unique_inputs = []
+    output_map = set()
+    for state in possible_inputs:
+        unique_key = state.copy()
+        unique_key[1:-1, 1:-1] = state_step(state)[1:-1, 1:-1]
+        if str(unique_key) not in output_map:
+            output_map.add(str(unique_key))
+
+    print('Unique keys: {}'.format(len(output_map)))
+    print('Compression factor: {}'.format(len(output_map) / num_inputs))
+
+
 def main():
-    DELTA = 1
+    DELTA = 5
     STEPS = 2000
 
     device = torch.device('cuda')
@@ -159,4 +184,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    find_all_possible_inputs(np.array([4, 5]))

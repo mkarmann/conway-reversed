@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib
 import random
 
+from bestguess.bestguess import BestGuessModule, MODEL_CHANNELS
 from stochastic_optimizer import BestChangeLayer
 
 # matplotlib.use('agg')
@@ -482,15 +483,20 @@ def improve_submission():
     # net.load_state_dict(torch.load('../out/training/snapshots/2020_09_25_18_51_41_GoL_delta_1/epoch_103.pt'))
     # net.eval()
     # net.to(device)
+    net = BestGuessModule(channels=MODEL_CHANNELS)
+    net.load_state_dict(torch.load('P:\\python\\convay-reversed\\best_guess\\out\\training\\snapshots\\128___2020_11_15_03_52_17_GoL_delta_1\\epoch_033.pt'))
+    print('Num parameters: {}'.format(net.get_num_trainable_parameters()))
+    net.to(device)
+    net.eval()
     bcls = [
-        BestChangeLayer(window=(4, 3), delta=DELTA, device=device)
+        BestChangeLayer(window=(3, 3), delta=DELTA, device=device)
     ]
 
     # -------------------
 
     # loop through examples
     start_time = time.time()
-    batch_size = 63
+    batch_size = 16
     stop_states = np.zeros((batch_size, 25, 25), dtype=np.int)
     indices = np.zeros(batch_size, dtype=np.int)
     current_sample_idx = 0
@@ -503,8 +509,6 @@ def improve_submission():
 
         delta = input_values[i][1]
         stop_state = input_values[i][2:].reshape((25, 25))
-
-        plot(stop_state)
 
         # skipping if wanted
         if delta != DELTA:
@@ -521,11 +525,11 @@ def improve_submission():
         # ------------------------
         # do the single prediction
         # ------------------------
-        pred_start_states = stop_states
+        pred_start_states = stop_states.copy()
         bcl = random.choice(bcls)
-        pred_start_states = bcl.solve_batch(pred_start_states, device, num_steps=2000)
-        # for d in range(delta):
-        #     pred_start_states = net.solve_batch(pred_start_states, device)
+        for d in range(delta):
+            pred_start_states = net.solve_batch(pred_start_states, device)
+        pred_start_states = bcl.solve_batch(stop_states, device, num_steps=4000, initial_states=pred_start_states)
 
         # -------------------
 

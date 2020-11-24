@@ -8,30 +8,32 @@ import numpy as np
 import matplotlib
 import random
 
-from stochastic_optimizer import BestChangeLayer
 from tensorboard.backend.event_processing import event_accumulator
-matplotlib.use('agg')
+# matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import time
 import torch
 import torch.nn as nn
 import os
 
+import torch.nn.functional as F
+
 from torch import optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-MODEL_CHANNELS = 16 * 6
+TRAIN_DELTA = 1
+MODEL_CHANNELS = 16 * 8
 LR = 1e-4
-BATCH_SIZE = 32         # normally 64
-BATCHES_PER_STEP = 2
-STEPS_PER_EPOCH = 1000
-EPOCHS = 30
-TEST_BATCHES = 4
+BATCH_SIZE = 64         # normally 64
+BATCHES_PER_STEP = 1
+STEPS_PER_EPOCH = 2000
+EPOCHS = 80
+TEST_BATCHES = 16
 TEST_SAMPLES_PER_BATCH = 16
 TEST_SAMPLES = TEST_BATCHES * TEST_SAMPLES_PER_BATCH
-HALF_LR_AFTER_N_EPOCHS = 10
-RUN_NAME = str(MODEL_CHANNELS) + time.strftime("___%Y_%m_%d_%H_%M_%S") + '_GoL_delta_' + str(1)
+HALF_LR_AFTER_N_EPOCHS = 7
+RUN_NAME = str(MODEL_CHANNELS) + time.strftime("___%Y_%m_%d_%H_%M_%S") + '_sub_delta_' + str(TRAIN_DELTA)
 SNAPSHOTS_DIR = '../../best_guess/out/training/snapshots/{}'.format(RUN_NAME)
 TENSORBOARD_LOGS_DIR = '../../best_guess/out/training/logs'
 VIDEO_DIR = '../../best_guess/out/training/videos/{}'.format(RUN_NAME)
@@ -90,27 +92,10 @@ def create_training_sample(shape=(25, 25), warmup_steps=5, delta=1, random_warmu
 class TiledConv2d(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
-        self.conv00 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
-        self.conv01 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
-        self.conv02 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
-        self.conv10 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
-        self.conv11 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
-        self.conv12 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
-        self.conv20 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
-        self.conv21 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
-        self.conv22 = nn.Conv2d(in_features, out_features, kernel_size=1, padding=0, bias=False)
+        self.conv = nn.Conv2d(in_features, out_features, kernel_size=3, bias=False)
 
     def forward(self, x):
-        return \
-            self.conv00(torch.roll(x, (-1, -1), dims=(2, 3))) + \
-            self.conv01(torch.roll(x, (-1, 0), dims=(2, 3))) + \
-            self.conv02(torch.roll(x, (-1, 1), dims=(2, 3))) + \
-            self.conv10(torch.roll(x, (0, -1), dims=(2, 3))) + \
-            self.conv11(torch.roll(x, (0, 0), dims=(2, 3))) + \
-            self.conv12(torch.roll(x, (0, 1), dims=(2, 3))) + \
-            self.conv20(torch.roll(x, (1, -1), dims=(2, 3))) + \
-            self.conv21(torch.roll(x, (1, 0), dims=(2, 3))) + \
-            self.conv22(torch.roll(x, (1, 1), dims=(2, 3)))
+        return self.conv(F.pad(x, [1, 1, 1, 1], mode='circular'))
 
 
 class TiledResBlock(nn.Module):
@@ -158,16 +143,16 @@ def create_net_input_array(state: np.array, predicted_mask: np.array, prediction
 
 
 class BestGuessDataset(Dataset):
-    def __init__(self, shape=(25, 25), warmup_steps=5, dataset_size=1024):
+    def __init__(self, delta=1, shape=(25, 25), dataset_size=1024):
+        self.delta = delta
         self.shape = shape
-        self.warmup_steps = warmup_steps
         self.dataset_size = dataset_size
 
     def __len__(self):
         return self.dataset_size
 
     def __getitem__(self, idx):
-        sample = create_training_sample(self.shape, self.warmup_steps, 1, random_warmup=True)
+        sample = create_training_sample(self.shape, delta=self.delta)
         start = sample["start"]
         end = sample["end"]
         predicted_mask = (np.random.uniform(0.0, 1.0, self.shape) > np.random.uniform(0.0, 1.0, (1, ))).astype(np.int)
@@ -381,13 +366,29 @@ class BestGuessModule(nn.Module):
         return predictions
 
 
-def test():
+def create_plot_pdf(channels: np.ndarray, parameters: np.ndarray, means: np.ndarray, variances: np.ndarray):
+    # plt.style.use('seaborn-whitegrid')
+    f = plt.figure(figsize=(6, 4))
+    plt.grid(color='gray')
+    plt.plot(parameters, means, "-o")
+    plt.xlabel('Anzahl Parameter in Mio.')
+    plt.ylabel('Fehlerquote in Prozent')
+    plt.fill_between(parameters, means - variances, means + variances,
+                     color='gray', alpha=0.2)
 
+    plt.show()
+    f.savefig("losses_graph.pdf", bbox_inches='tight')
+
+
+def test():
+    TEST_DELTA = 2
     model_fnames = []
     log_fnames = []
     num_channels = []
     for fname in os.walk(os.path.dirname(SNAPSHOTS_DIR)):
-        model_fname = fname[0] + '\epoch_030.pt'
+        model_fname = fname[0] + '\epoch_033.pt'
+        if '15_03_52_17' not in model_fname:
+            continue
         if os.path.exists(model_fname):
             run_name = os.path.split(fname[0])[1]
             model_fnames.append(model_fname)
@@ -404,9 +405,9 @@ def test():
         training_hours.append((loss_train[-1].wall_time - loss_train[0].wall_time) / 60 / 60)
 
     device = torch.device('cuda')
-    num_test_batches = 8
-    test_batch_size = 16
-    end_states = np.array([create_training_sample(random_warmup=True)['end'] for _ in range(num_test_batches * test_batch_size)]).reshape((num_test_batches, test_batch_size, 25, 25))
+    num_test_batches = 50
+    test_batch_size = 10
+    end_states = np.array([create_training_sample(delta=5, random_warmup=False)['end'] for _ in range(num_test_batches * test_batch_size)]).reshape((num_test_batches, test_batch_size, 25, 25))
     means = []
     stds = []
     num_parameters = []
@@ -420,11 +421,15 @@ def test():
 
         losses = []
         for batch in end_states:
-            predicted_starts = net.solve_batch(batch, device)
+            predicted_starts = batch.copy()
+            for g in range(TEST_DELTA):
+                predicted_starts = net.solve_batch(predicted_starts, device)
             # predicted_starts = batch
 
-            for ps, b in zip(predicted_starts, batch):
-                losses.append(state_loss(state_step(ps), b))
+            for pstop, gt in zip(predicted_starts, batch):
+                for g in range(TEST_DELTA):
+                    pstop = state_step(pstop)
+                losses.append(state_loss(pstop, gt))
         losses = np.array(losses, dtype=np.float)
         print('Mean error in percent: {:.3f}%'.format(np.mean(losses) * 100))
         means.append(np.mean(losses))
@@ -453,13 +458,14 @@ def test():
 def train():
     device = torch.device('cuda')
 
-    dataset = BestGuessDataset(dataset_size=STEPS_PER_EPOCH * BATCH_SIZE * BATCHES_PER_STEP)
+    dataset = BestGuessDataset(delta=TRAIN_DELTA, dataset_size=STEPS_PER_EPOCH * BATCH_SIZE * BATCHES_PER_STEP)
     loader = DataLoader(dataset,
                         batch_size=BATCH_SIZE,
-                        num_workers=1,
+                        num_workers=5,
                         pin_memory=True)
 
     net = BestGuessModule(channels=MODEL_CHANNELS)
+    # net.load_state_dict(torch.load('P:\\python\\convay-reversed\\best_guess\\out\\training\\snapshots\\128___2020_11_15_03_52_17_GoL_delta_1\\epoch_033.pt'))
     print('Num parameters: {}'.format(net.get_num_trainable_parameters()))
     net.to(device)
     optimizer = optim.Adam(net.parameters(), lr=LR)
@@ -508,10 +514,12 @@ def train():
         print("Calculate epoch loss")
         epoch_loss = 0
         for n in range(TEST_BATCHES):
-            end_states = np.array([create_training_sample(random_warmup=True)['end'] for _ in range(TEST_SAMPLES_PER_BATCH)])
+            end_states = np.array([create_training_sample(delta=1, random_warmup=False)['end'] for _ in range(TEST_SAMPLES_PER_BATCH)])
             pred_start_states = net.solve_batch(end_states, device)
             for end_state, pred_start_state in zip(end_states, pred_start_states):
-                pred_end_state = state_step(pred_start_state)
+                pred_end_state = pred_start_state.copy()
+                for g in range(TRAIN_DELTA):
+                    pred_end_state = state_step(pred_end_state)
                 epoch_loss += state_loss(end_state, pred_end_state)
         epoch_loss /= TEST_SAMPLES
         print("Epoch test loss {}".format(epoch_loss))
@@ -533,4 +541,11 @@ def train():
 
 
 if __name__ == "__main__":
-    test()
+    train()
+    # create_plot_pdf(
+    #     np.array([16, 24, 32, 40, 48, 64, 80, 96]),
+    #     np.array([0.2, 0.4, 0.8, 1.2, 1.8, 3.1, 4.9, 7.1]),
+    #     np.array([1.31, 0.99, 0.85, 0.74, 0.69, 0.50, 0.44, 0.40]),
+    #     np.array([1.23, 0.95, 0.90, 0.78, 0.76, 0.58, 0.54, 0.52])
+    # )
+    # test()

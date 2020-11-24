@@ -5,7 +5,9 @@ import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
-SUBMISSION_FILE = "../out/submissions/submission_15.csv"
+# SUBMISSION_FILE = "../out/submissions/submission_23.csv"
+# SUBMISSION_FILE = "../data/imgsegsolver/submission.csv"
+SUBMISSION_FILE = "../data/z3solver/submission.csv"
 
 
 def main():
