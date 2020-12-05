@@ -418,6 +418,7 @@ def test():
     net.load_state_dict(torch.load('../out/training/snapshots/2020_09_25_18_51_41_GoL_delta_1/epoch_103.pt'))
     net.eval()
     net.to(device)
+    print(net.get_num_trainable_parameters())
 
     df_input = pd.read_csv("../input/test.csv")
     input_values = df_input.values
@@ -449,7 +450,7 @@ def test():
 
 def improve_submission():
 
-    DELTA = 5
+    DELTA = 3
 
     if not os.path.isdir(SUBMISSION_DIR):
         os.makedirs(SUBMISSION_DIR)
@@ -484,7 +485,7 @@ def improve_submission():
     # net.eval()
     # net.to(device)
     net = BestGuessModule(channels=MODEL_CHANNELS)
-    net.load_state_dict(torch.load('P:\\python\\convay-reversed\\best_guess\\out\\training\\snapshots\\128___2020_11_15_03_52_17_GoL_delta_1\\epoch_033.pt'))
+    net.load_state_dict(torch.load('P:\\python\\convay-reversed\\best_guess\\out\\training\\snapshots\\128___2020_11_16_04_43_05_GoL_delta_1continue\\epoch_040.pt'))
     print('Num parameters: {}'.format(net.get_num_trainable_parameters()))
     net.to(device)
     net.eval()
@@ -529,7 +530,7 @@ def improve_submission():
         bcl = random.choice(bcls)
         for d in range(delta):
             pred_start_states = net.solve_batch(pred_start_states, device)
-        pred_start_states = bcl.solve_batch(stop_states, device, num_steps=4000, initial_states=pred_start_states)
+        pred_start_states = bcl.solve_batch(stop_states, device, num_steps=2000, initial_states=pred_start_states)
 
         # -------------------
 
@@ -545,7 +546,8 @@ def improve_submission():
                 submission_values[index, 1:] = pred_start_state.reshape((-1,))
                 scores_values[index] = new_score
                 print("Mean error is now {}".format(np.mean(scores_values, dtype=np.float) / (25 * 25)))
-
+        if np.mean(scores_values, dtype=np.float) / (25 * 25) < 0.012346:
+            break
         print("Estimated time left until finished: {} seconds".format(int((time.time() - start_time) * (len(submission_values) - i - 1) / (i + 1))))
 
     print("\n------------------------")

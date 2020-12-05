@@ -4,7 +4,9 @@ import torch
 import matplotlib.pyplot as plt
 import torch.nn as nn
 
-# from main import create_training_sample, state_step
+import torch.nn.functional as F
+
+from bestguess.bestguess import create_training_sample
 
 matplotlib.use('TkAgg')
 
@@ -19,29 +21,6 @@ def conway_layer(x: torch.tensor):
     return binary_clamp(surround_sum + x - 2) - binary_clamp(surround_sum - 3)
 
 
-def tilePadding(x: torch.Tensor, left, right, top, bottom):
-    padding = (left, right, top, bottom)
-
-    top_left = np.array([top, left], dtype=np.int)
-    bottom_right = np.array([bottom, right], dtype=np.int)
-    shape = np.array((x.size()[2], x.size()[3]), dtype=np.int)
-
-    tl_num_tiles = (top_left + (shape - 1)) // shape
-    br_num_tiles = (top_left + (shape - 1)) // shape
-    total_num_repeats = tl_num_tiles + br_num_tiles + 1
-
-    tiled = x.repeat(1, 1, total_num_repeats[0], total_num_repeats[1])
-
-    # cut out the wanted size
-    out_shape = shape + top_left + bottom_right
-    padding_top_left = tl_num_tiles * shape - top_left
-
-    return tiled[:, :,
-           padding_top_left[0]:(padding_top_left[0] + out_shape[0]),
-           padding_top_left[1]:(padding_top_left[1] + out_shape[1])
-           ]
-
-
 class TilePad2d(nn.Module):
     def __init__(self, left, right, top, bottom):
         super().__init__()
@@ -51,7 +30,7 @@ class TilePad2d(nn.Module):
         self.bottom = bottom
 
     def forward(self, x):
-        return tilePadding(x, self.left, self.right, self.top, self.bottom)
+        return F.pad(x, [self.left, self.right, self.top, self.bottom], mode='circular')
 
 
 class BestChangeLayer(nn.Module):
@@ -132,6 +111,14 @@ class BestChangeLayer(nn.Module):
 
         return np.clip(np.rint(np.array(inputs_batch.tolist())).astype(np.int), 0, 1).reshape(states.shape)
 
+    def solve_anim(self, initial_state: np.array, target: np.array, device: torch.device, num_steps=1000):
+        inputs_batch = torch.from_numpy(initial_state).reshape(1, 1, initial_state.shape[0], initial_state.shape[1]).float().to(device)
+        targets_batch = torch.from_numpy(target).reshape(1, 1, target.shape[0], target.shape[1]).float().to(device)
+
+        for i in range(num_steps):
+            inputs_batch = self(inputs_batch, targets_batch)
+            current_input = np.clip(np.rint(np.array(inputs_batch.tolist())).astype(np.int), 0, 1).reshape(initial_state.shape)
+
 
 def find_all_possible_inputs(window_size: np.ndarray):
     num_bins = window_size[0] * window_size[1]
@@ -184,4 +171,4 @@ def main():
 
 
 if __name__ == "__main__":
-    find_all_possible_inputs(np.array([4, 5]))
+    main()

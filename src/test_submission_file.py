@@ -5,9 +5,11 @@ import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
-# SUBMISSION_FILE = "../out/submissions/submission_23.csv"
+# SUBMISSION_FILE = "../out/submissions/submission_29.csv"
 # SUBMISSION_FILE = "../data/imgsegsolver/submission.csv"
-SUBMISSION_FILE = "../data/z3solver/submission.csv"
+# SUBMISSION_FILE = "../data/z3solver/submission.csv"
+# SUBMISSION_FILE = "../data/SoliSet/submission.csv"
+SUBMISSION_FILE = "../data/merge/submission.csv"
 
 
 def main():
@@ -28,11 +30,13 @@ def main():
         delta = input_values[i][1]
         stop_state = input_values[i][2:].reshape((25, 25))
         pred_start_state = submission_values[i][1:].reshape((25, 25))
-
+        print(pred_start_state)
         pred_end_state = pred_start_state.copy()
+        print(delta)
         for d in range(delta):
             pred_end_state = state_step(pred_end_state)
-
+        print(pred_end_state)
+        exit()
         loss = state_loss(pred_end_state, stop_state)
         sum += loss
         losses[i] = loss

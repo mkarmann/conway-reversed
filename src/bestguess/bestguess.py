@@ -25,7 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 TRAIN_DELTA = 1
 MODEL_CHANNELS = 16 * 8
 LR = 1e-4
-BATCH_SIZE = 64         # normally 64
+BATCH_SIZE = 64
 BATCHES_PER_STEP = 1
 STEPS_PER_EPOCH = 2000
 EPOCHS = 80
@@ -503,13 +503,6 @@ def train():
             total_steps += 1
 
         net.eval()
-        # print("Create test video")
-        # display_sample = create_training_sample()
-        # net.solve(display_sample['end'],
-        #           device,
-        #           display_sample['start'],
-        #           video_fname='{}/epoch_{:03}.avi'.format(VIDEO_DIR, epoch + 1)
-        #           )
 
         print("Calculate epoch loss")
         epoch_loss = 0

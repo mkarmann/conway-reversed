@@ -3,10 +3,13 @@ import os
 import numpy as np
 import pandas as pd
 
-from main import SUBMISSION_DIR, SUBMISSION_FILE_FORMAT, SCORE_FILE_FORMAT, state_step
+from main import SUBMISSION_DIR, SUBMISSION_FILE_FORMAT, SCORE_FILE_FORMAT, state_step, plot
 
 # TO_FUSE_SUBMISSION_FNAME = "../data/imgsegsolver/submission.csv"
-TO_FUSE_SUBMISSION_FNAME = "../data/z3solver/submission.csv"
+# TO_FUSE_SUBMISSION_FNAME = "../data/z3solver/submission.csv"
+# TO_FUSE_SUBMISSION_FNAME = "../data/SoliSet/submission.csv" # no change at all
+# TO_FUSE_SUBMISSION_FNAME = "../data/merge/submission.csv"
+TO_FUSE_SUBMISSION_FNAME = "../data/kandm/submission.csv"
 
 
 def improve_submission():
@@ -26,12 +29,12 @@ def improve_submission():
 
     input_csv = "../input/test.csv"
     df_input = pd.read_csv(input_csv)
-    input_values = np.array(df_input.values)
+    input_values = df_input.values
     scores_values = np.array(df_scores.values)
     submission_values = np.array(df_submission.values)
 
     df_fuse_submission = pd.read_csv(TO_FUSE_SUBMISSION_FNAME)
-    fuse_submission_values = np.array(df_fuse_submission.values)
+    fuse_submission_values = df_fuse_submission.values
 
     for i in range(len(submission_values)):
 
@@ -45,10 +48,9 @@ def improve_submission():
         start_state = submission_values[i][1:].reshape((25, 25))
         fuse_start_state = fuse_submission_values[i][1:].reshape((25, 25))
 
-
-        fuse_end_state = fuse_start_state.copy()
+        pred_end_state = fuse_start_state.copy()
         for d in range(delta):
-            pred_end_state = state_step(fuse_end_state)
+            pred_end_state = state_step(pred_end_state)
 
         new_score = np.sum(np.abs(pred_end_state - stop_state))
         old_score = scores_values[i][0]
