@@ -3,7 +3,9 @@
 I competed together with Kota Iizuka.
 This repository only contains the code of my approach.
 
-
+- [Approach](#approach)
+- [BestGuess](#bestguess)
+- [Notebook](#notebook)
 
 ## Approach
 
