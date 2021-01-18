@@ -7,7 +7,7 @@ This repository only contains the code of my approach.
 
 ## Approach
 
-![som map iamge](_images/basic_concept.png)
+![basic_concept_image](_images/basic_concept.png)
 
 Given a game of life `end state`, the task is to find a valid `start state`, which evolves to the desired `end state` after `delta` steps. 
 
@@ -19,7 +19,7 @@ The approach has two main components:
 
 ### BestGuess
 
-![som map iamge](_images/best_guess.png)
+![best_guess iamge](_images/best_guess.png)
 
 The neural network only predicts one cell at a time, as there are many possible `start state` which lead to the same `end state`. Inspired by language models, it gets the already predicted cells as input to create an in itself consistent result.
 
