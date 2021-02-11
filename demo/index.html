@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<style>
+
+    #page {
+        max-width: 30rem;
+        margin: 0 auto;
+    }
+
+    #board {
+        height: 25rem;
+        width: 25rem;
+        margin: 0 auto;
+        border: 0.1rem solid #aaa;
+        border-radius: 1rem;
+
+        display: grid;
+        grid-template-columns: auto auto auto auto auto auto;
+        grid-gap: 0.5rem;
+        padding: 0.5rem;
+    }
+
+    #controls {
+        display: grid;
+        grid-template-columns: auto auto auto auto auto;
+        margin-top: 2rem;
+    }
+
+    .grid_cell {
+        background-color: #ddd;
+    }
+
+    .cell {
+        position: relative;
+        background-color: #3480eb;
+        transition: 0.15s ease-out;
+        width: 0;
+        height: 0;
+        top: 50%;
+        left: 50%;
+    }
+
+    .alive {
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+    }
+
+
+</style>
+<head>
+    <meta charset="UTF-8">
+    <title>BestGuess - Demo</title>
+</head>
+<body>
+    <div id="page">
+        <div id="board"></div>
+        <div id="controls">
+            <button id="animateBackwardsButton" onclick="controlAnimateForward()">
+                &#60; &#60; Animate Backwards
+            </button>
+            <button id="stepBackwardsButton" onclick="controlStepForward()">
+                &#60; Step Backwards
+            </button>
+            <button id="stopButton" onclick="controlStepForward()">
+                &#9744; Stop
+            </button>
+            <button id="stepForwardButton" onclick="controlStepForward()">
+                Step Forward &#62;
+            </button>
+            <button id="animateForwardButton" onclick="controlAnimateForward()">
+                Animate Forward &#62; &#62;
+            </button>
+        </div>
+    </div>
+
+</body>
+<script>
+    const resolution = 6
+    const boardElement = document.getElementById("board")
+    const animateBackwardsButton = document.getElementById("animateBackwardsButton")
+    const stepBackwardsButton = document.getElementById("stepBackwardsButton")
+    const stopButton = document.getElementById("stopButton")
+    const stepForwardButton = document.getElementById("stepForwardButton")
+    const animateForwardButton = document.getElementById("animateForwardButton")
+    let boardElements = []
+    let boardState = []
+    let control_animate = false;
+
+    function redrawBoard() {
+        for (let y=0; y<resolution; y++){
+            let row = boardState[y]
+            let rowElements = boardElements[y]
+            for (let x=0; x<resolution; x++){
+                let cell = rowElements[x]
+                let value = row[x]
+                if (value === 1) {
+                    cell.classList.add("alive");
+                }
+                else {
+                    cell.classList.remove("alive");
+                }
+            }
+        }
+    }
+
+    // Initialize
+    for (let y=0; y<resolution; y++){
+        let row = []
+        let rowElements = []
+        for (let x=0; x<resolution; x++){
+            let gridCell = document.createElement("div")
+            gridCell.className = "grid_cell"
+            gridCell.onclick = function() {controlFlipState(x, y);};
+            let cell = document.createElement("div")
+            cell.className = "cell";
+            gridCell.appendChild(cell)
+            boardElement.appendChild(gridCell)
+            row.push(0)
+            rowElements.push(cell)
+        }
+        console.log(y)
+        boardState.push(row)
+        boardElements.push(rowElements)
+    }
+
+    function stepForward() {
+        let newState = []
+        for (let y=0; y<resolution; y++){
+            let row = []
+            for (let x=0; x<resolution; x++){
+                let currentState = boardState[y][x]
+                let neighbours =
+                    boardState[(y+1)%resolution][(x+1)%resolution] +
+                    boardState[(y+1)%resolution][(x)%resolution] +
+                    boardState[(y+1)%resolution][(x+resolution-1)%resolution] +
+                    boardState[(y)%resolution][(x+resolution-1)%resolution] +
+                    boardState[(y+resolution-1)%resolution][(x+resolution-1)%resolution] +
+                    boardState[(y+resolution-1)%resolution][(x)%resolution] +
+                    boardState[(y+resolution-1)%resolution][(x+1)%resolution] +
+                    boardState[(y)%resolution][(x+1)%resolution]
+                if (currentState === 1) {
+                    if (neighbours === 2 || neighbours === 3) {
+                        row.push(1)
+                    }
+                    else {
+                        row.push(0)
+                    }
+                }
+                else {
+                    if (neighbours === 3) {
+                        row.push(1)
+                    }
+                    else {
+                        row.push(0)
+                    }
+                }
+            }
+            newState.push(row)
+        }
+        boardState = newState
+        redrawBoard()
+    }
+
+    function animate() {
+        if (control_animate) {
+            stepForward()
+            setTimeout(function () {
+                animate()
+            }, 500)
+        }
+    }
+
+    setTimeout(function () {
+        boardState[2][0] = 1
+        boardState[2][1] = 1
+        boardState[2][2] = 1
+        boardState[1][2] = 1
+        boardState[0][1] = 1
+        redrawBoard()
+        setTimeout(function () {
+            controlAnimateForward()
+        }, 500)
+    }, 300)
+
+    function controlAnimateForward() {
+        if (control_animate === false) {
+            control_animate = true
+            animate()
+        }
+        updateControls()
+    }
+
+    function controlStepForward() {
+        control_animate = false
+        stepForward()
+        redrawBoard()
+        updateControls()
+    }
+
+    function controlStopAnimation() {
+        control_animate = false
+        updateControls()
+    }
+
+    function controlFlipState(x, y){
+        control_animate = false
+        boardState[y][x] = 1 - boardState[y][x]
+        redrawBoard()
+        updateControls()
+    }
+
+    function updateControls() {
+        animateForwardButton.disabled = control_animate
+        stopButton.disabled = !control_animate
+    }
+
+</script>
+</html>
