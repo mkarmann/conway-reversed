@@ -2,8 +2,27 @@
 <html lang="en">
 <style>
 
+    html {
+        font-family: Arial;
+    }
+
+    h1 {
+        margin-top: 4rem;
+        color: #777;
+        text-align: center;
+    }
+
+    h2 {
+        color: #999;
+        text-align: center;
+    }
+
+    p {
+        color: #333;
+    }
+
     #page {
-        max-width: 30rem;
+        max-width: 40rem;
         margin: 0 auto;
     }
 
@@ -24,10 +43,13 @@
         display: grid;
         grid-template-columns: auto auto auto auto auto;
         margin-top: 2rem;
+        margin-bottom: 4rem;
+        grid-gap: 0.5rem;
     }
 
     .grid_cell {
         background-color: #ddd;
+        transition: 0.1s ease-out;
     }
 
     .cell {
@@ -52,15 +74,18 @@
 <head>
     <meta charset="UTF-8">
     <title>BestGuess - Demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
 </head>
 <body>
     <div id="page">
+        <h1>BestGuess - Demo</h1>
+        <h2>Reversing the Game of Life with AI</h2>
         <div id="board"></div>
         <div id="controls">
             <button id="animateBackwardsButton" onclick="controlAnimateForward()">
-                &#60; &#60; Animate Backwards
+                &#60;&#60; Animate Backwards
             </button>
-            <button id="stepBackwardsButton" onclick="controlStepForward()">
+            <button id="stepBackwardsButton" onclick="controlStepBackwards()">
                 &#60; Step Backwards
             </button>
             <button id="stopButton" onclick="controlStepForward()">
@@ -70,12 +95,17 @@
                 Step Forward &#62;
             </button>
             <button id="animateForwardButton" onclick="controlAnimateForward()">
-                Animate Forward &#62; &#62;
+                Animate Forward &#62;&#62;
             </button>
         </div>
+        <p>
+            This is a demo using the network developed in ....
+        </p>
     </div>
 
 </body>
+<script src="https://cdn.jsdelivr.net/npm/onnxjs/dist/onnx.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/nicolaspanel/numjs@0.16.0/dist/numjs.min.js"></script>
 <script>
     const resolution = 6
     const boardElement = document.getElementById("board")
@@ -84,9 +114,18 @@
     const stopButton = document.getElementById("stopButton")
     const stepForwardButton = document.getElementById("stepForwardButton")
     const animateForwardButton = document.getElementById("animateForwardButton")
+    const onnxSession = new onnx.InferenceSession();
+    onnxSession.loadModel("./model.onnx").then(() => {
+        // generate model input
+        console.log('Model loaded')
+        model_loaded = true
+      });
     let boardElements = []
     let boardState = []
     let control_animate = false;
+    let control_animate_direction_backwards = false;
+    let model_loaded = false;
+
 
     function redrawBoard() {
         for (let y=0; y<resolution; y++){
@@ -120,7 +159,6 @@
             row.push(0)
             rowElements.push(cell)
         }
-        console.log(y)
         boardState.push(row)
         boardElements.push(rowElements)
     }
@@ -163,6 +201,85 @@
         redrawBoard()
     }
 
+    function createInputs(endState, mask, prediction) {
+        ones = nj.ones([resolution, resolution], 'int32')
+
+        input_dead = ones.subtract(endState)
+        input_alive = endState
+        input_unpredicted = ones.subtract(mask)
+        input_predicted_dead = ones.subtract(prediction).multiply(mask)
+        input_predicted_alive = prediction.multiply(mask)
+
+        inpt = nj.stack([
+            input_dead,
+            input_alive,
+            input_unpredicted,
+            input_predicted_dead,
+            input_predicted_alive
+        ])
+
+        return [new onnx.Tensor(new Float32Array(inpt.tolist().flat(2)), "float32", [1, 5, resolution, resolution])]
+    }
+
+    // very sad that numjs does not include this function (using tensorflowjs next time)
+    function argMax(lists) {
+        let max_val = -999
+        let res = [0, 0, 0]
+        for (let x=0; x<lists.length; x++) {
+            let x_elem = lists[x]
+            for (let y=0; y<x_elem.length; y++) {
+                let y_elem = x_elem[y]
+                for (let z=0; z<y_elem.length; z++) {
+                    let z_elem = y_elem[z]
+                    if (z_elem > max_val) {
+                        max_val = z_elem
+                        res = [x, y, z]
+                    }
+                }
+            }
+        }
+
+        return res
+    }
+
+    function solveBackwards(endState, mask, prediction, current_iter=0) {
+        const inferenceInputs = createInputs(endState, mask, prediction);
+        if (current_iter === resolution * resolution) {
+            boardState = prediction.tolist()
+            redrawBoard()
+            return;
+        }
+
+        setTimeout(function () {
+            onnxSession.run(inferenceInputs).then((output) => {
+                const ouptTensor = nj.array(Array.prototype.slice.call(output.values().next().value.data)).reshape(2, resolution, resolution);
+                ones = nj.ones([resolution, resolution], 'int32')
+                inv_mask = ones.subtract(mask)
+                dup_inv_mask = nj.stack([
+                    inv_mask,
+                    inv_mask
+                ])
+                const bestGuess = argMax(nj.array(ouptTensor.tolist()).multiply(dup_inv_mask).tolist())
+                console.log(bestGuess)
+                mask.set(bestGuess[1], bestGuess[2], 1)
+                prediction.set(bestGuess[1], bestGuess[2], bestGuess[0])
+
+                solveBackwards(endState, mask, prediction, current_iter + 1)
+            });
+        }, 0);
+    }
+
+    function stepBackwards() {
+
+        if (!model_loaded) {
+            return;
+        }
+        endState = nj.array(boardState, 'int32')
+        mask = nj.zeros([resolution, resolution], 'int32')
+        prediction = nj.zeros([resolution, resolution], 'int32')
+        solveBackwards(endState, mask, prediction)
+    }
+
     function animate() {
         if (control_animate) {
             stepForward()
@@ -195,7 +312,12 @@
     function controlStepForward() {
         control_animate = false
         stepForward()
-        redrawBoard()
+        updateControls()
+    }
+
+    function controlStepBackwards() {
+        control_animate = false
+        stepBackwards()
         updateControls()
     }
 
@@ -215,6 +337,6 @@
         animateForwardButton.disabled = control_animate
         stopButton.disabled = !control_animate
     }
-
 </script>
+
 </html>
