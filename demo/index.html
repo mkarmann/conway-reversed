@@ -81,14 +81,22 @@
         <h1>BestGuess - Demo</h1>
         <h2>Reversing the Game of Life with AI</h2>
         <div id="board"></div>
+        <svg width="100%" height="5rem" viewBox="0 0 800 800" preserveAspectRatio="xMidYMid meet">
+            <circle cx="400" cy="400" r="300" fill="#ddd"/>
+            <g transform=" translate(400 400) rotate(-90) scale(1 -1)">
+                <path id="progArc" d="M 0 0 L 300 0 A 300 300 0 1 0 300 0 L 0 0" fill="#3480eb"></path>
+            </g>
+            <circle cx="400" cy="400" r="200" fill="#fff"/>
+            <text id="progArcDesc" x="400" y="453" text-anchor="middle" font-size="150">Load model...</text>
+        </svg>
         <div id="controls">
-            <button id="animateBackwardsButton" onclick="controlAnimateForward()">
+            <button id="animateBackwardsButton" onclick="controlAnimateBackwards()">
                 &#60;&#60; Animate Backwards
             </button>
             <button id="stepBackwardsButton" onclick="controlStepBackwards()">
                 &#60; Step Backwards
             </button>
-            <button id="stopButton" onclick="controlStepForward()">
+            <button id="stopButton" onclick="controlStopAnimation()">
                 &#9744; Stop
             </button>
             <button id="stepForwardButton" onclick="controlStepForward()">
@@ -109,6 +117,8 @@
 <script>
     const resolution = 6
     const boardElement = document.getElementById("board")
+    const progressArcElement = document.getElementById("progArc")
+    const progressArcDescriptionElement = document.getElementById("progArcDesc")
     const animateBackwardsButton = document.getElementById("animateBackwardsButton")
     const stepBackwardsButton = document.getElementById("stepBackwardsButton")
     const stopButton = document.getElementById("stopButton")
@@ -118,13 +128,16 @@
     onnxSession.loadModel("./model.onnx").then(() => {
         // generate model input
         console.log('Model loaded')
+        progressArcDescriptionElement.innerHTML = "Ready!"
         model_loaded = true
       });
     let boardElements = []
     let boardState = []
     let control_animate = false;
     let control_animate_direction_backwards = false;
+    let calculating_backwards = false;
     let model_loaded = false;
+    let control_cancel_backwards = false;
 
 
     function redrawBoard() {
@@ -244,9 +257,17 @@
 
     function solveBackwards(endState, mask, prediction, current_iter=0) {
         const inferenceInputs = createInputs(endState, mask, prediction);
+        updateProgressArc(current_iter / (resolution * resolution))
+        if (control_cancel_backwards) {
+            calculating_backwards = false
+            updateControls()
+            return;
+        }
         if (current_iter === resolution * resolution) {
             boardState = prediction.tolist()
+            calculating_backwards = false
             redrawBoard()
+            updateControls()
             return;
         }
 
@@ -274,18 +295,72 @@
         if (!model_loaded) {
             return;
         }
+
+        calculating_backwards = true
+        control_cancel_backwards = false
+        updateControls()
+
         endState = nj.array(boardState, 'int32')
         mask = nj.zeros([resolution, resolution], 'int32')
         prediction = nj.zeros([resolution, resolution], 'int32')
         solveBackwards(endState, mask, prediction)
     }
 
+    function updateProgressArc(progress) {
+        progressArcDescriptionElement.innerHTML = Math.round(progress * 100) + "%"
+        // Arc code modified from https://codepen.io/smlsvnssn/pen/FolaA
+        progressArcElement.setAttribute("d", createSvgArc(0, 0, 300, 0, progress * Math.PI * 2))
+    }
+
+    function createSvgArc(x, y, r, startAngle, endAngle) {
+        if (startAngle > endAngle) {
+            var s = startAngle;
+            startAngle = endAngle;
+            endAngle = s;
+        }
+        if (endAngle - startAngle > Math.PI * 2) {
+            endAngle = Math.PI * 1.99999;
+        }
+
+        var largeArc = endAngle - startAngle <= Math.PI ? 0 : 1;
+
+        return [
+            "M",
+            x,
+            y,
+            "L",
+            x + Math.cos(startAngle) * r,
+            y - Math.sin(startAngle) * r,
+            "A",
+            r,
+            r,
+            0,
+            largeArc,
+            0,
+            x + Math.cos(endAngle) * r,
+            y - Math.sin(endAngle) * r,
+            "L",
+            x,
+            y
+        ].join(" ");
+    }
+
     function animate() {
         if (control_animate) {
-            stepForward()
-            setTimeout(function () {
-                animate()
-            }, 500)
+            if (control_animate_direction_backwards) {
+                if (!calculating_backwards) {
+                    stepBackwards()
+                }
+                setTimeout(function () {
+                    animate()
+                }, 0)
+            }
+            else {
+                stepForward()
+                setTimeout(function () {
+                    animate()
+                }, 1000)
+            }
         }
     }
 
@@ -298,10 +373,12 @@
         redrawBoard()
         setTimeout(function () {
             controlAnimateForward()
-        }, 500)
+        }, 1000)
     }, 300)
 
     function controlAnimateForward() {
+        control_cancel_backwards = true
+        control_animate_direction_backwards = false
         if (control_animate === false) {
             control_animate = true
             animate()
@@ -311,6 +388,7 @@
 
     function controlStepForward() {
         control_animate = false
+        control_cancel_backwards = true
         stepForward()
         updateControls()
     }
@@ -321,8 +399,18 @@
         updateControls()
     }
 
+    function controlAnimateBackwards() {
+        control_animate_direction_backwards = true
+        if (control_animate === false) {
+            control_animate = true
+            animate()
+        }
+        updateControls()
+    }
+
     function controlStopAnimation() {
         control_animate = false
+        control_cancel_backwards = true
         updateControls()
     }
 
@@ -334,8 +422,12 @@
     }
 
     function updateControls() {
-        animateForwardButton.disabled = control_animate
-        stopButton.disabled = !control_animate
+        animateForwardButton.disabled = control_animate && !control_animate_direction_backwards || (calculating_backwards && !control_animate)
+        stepForwardButton.disabled = (calculating_backwards && !control_animate)
+        stopButton.disabled = !control_animate && !calculating_backwards
+        stepBackwardsButton.disabled = calculating_backwards
+        animateBackwardsButton.disabled = control_animate && control_animate_direction_backwards || (calculating_backwards && !control_animate)
+
     }
 </script>
 
