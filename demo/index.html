@@ -18,6 +18,8 @@
     }
 
     h3 {
+        margin-top: 4rem;
+        color: #777;
         text-align: center;
     }
 
@@ -114,11 +116,37 @@
             This demo was created using the BestGuess neural network submitted to the "Conway's Reverse Game of Life 2020" Kaggle challenge.
         </p>
         <h3>
-            What are the gray and blue squares?
+            About
         </h3>
         <p>
-            asdfasdfasd
+            The demo simulates a game of life with a 6x6 cells grid. In the original challenge, the grid had a size of 25x25.
+            Given a start state, the next state can be calculated by following a simple set of rules.
+            The challenge of the competition was to reverse this process. Instead of predicting the next state, the task is to find a valid previous state.
+            This means, for a given end state, we want to find a start state.
         </p>
+        <p>
+            The 6x6 grid on the top shows the current state of the game of life. Dead cells are shown in gray and living cells are shown in blue.
+            Below the board is a circle indicating the current state of the neural network. It will only be used for calculating previous states and shows the progress of the prediction. (The first iteration might be slower)
+        </p>
+        <h3>
+            Controls
+        </h3>
+        <p>
+            Click on a cell to change its state to either alive (blue) or dead (gray).
+        </p>
+        <ul>
+            <li>Animate Backwards: Animate multiple steps backwards with the AI (difficult, slow).</li>
+            <li>Animate Backwards: Use the AI to calculate the previous state (difficult, slow).</li>
+            <li>Stop: Stop the animation or cancel the backwards calculation.</li>
+            <li>Animate Backwards: Calculate one step forward (easy, fast).</li>
+            <li>Animate Backwards: Animate multiple steps forward (easy, fast).</li>
+        </ul>
+        <br />
+        <br />
+        <br />
+        <br />
+        <br />
+        <br />
     </div>
 
 </body>
@@ -140,6 +168,7 @@
         console.log('Model loaded')
         progressArcDescriptionElement.innerHTML = "Ready!"
         model_loaded = true
+        updateControls()
       });
     let boardElements = []
     let boardState = []
@@ -375,16 +404,15 @@
     }
 
     setTimeout(function () {
-        boardState[2][0] = 1
-        boardState[2][1] = 1
-        boardState[2][2] = 1
+        boardState[3][1] = 1
+        boardState[3][2] = 1
+        boardState[3][3] = 1
+        boardState[2][3] = 1
         boardState[1][2] = 1
-        boardState[0][1] = 1
         redrawBoard()
-        setTimeout(function () {
-            controlAnimateForward()
-        }, 1000)
-    }, 300)
+
+    }, 100)
+    updateControls()
 
     function controlAnimateForward() {
         control_cancel_backwards = true
@@ -435,8 +463,8 @@
         animateForwardButton.disabled = control_animate && !control_animate_direction_backwards || (calculating_backwards && !control_animate)
         stepForwardButton.disabled = (calculating_backwards && !control_animate)
         stopButton.disabled = !control_animate && !calculating_backwards
-        stepBackwardsButton.disabled = calculating_backwards
-        animateBackwardsButton.disabled = control_animate && control_animate_direction_backwards || (calculating_backwards && !control_animate)
+        stepBackwardsButton.disabled = calculating_backwards || !model_loaded
+        animateBackwardsButton.disabled = control_animate && control_animate_direction_backwards || (calculating_backwards && !control_animate) || !model_loaded
 
     }
 </script>
